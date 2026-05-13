@@ -1,13 +1,11 @@
 """
-VOID MAZE — v2.0
-Changes from v1.3:
-  - Main menu: SINGLE PLAYER / MULTIPLAYER / QUIT
-  - Multiplayer: ESCAPE MODE and DEAD BY DAYLIGHT (host/join via Radmin VPN)
-  - network.py module for TCP connection
-  - Multiple player colors in MP
-pip install pygame
+VOID MAZE — v2.1
+Changes from v2.0:
+  - Borderless fullscreen for all players: NOFRAME + SDL_VIDEO_WINDOW_POS="0,0"
+    so the window covers the whole screen without exclusive fullscreen mode-change.
 """
 
+import os
 import pygame
 import math
 import random
@@ -15,6 +13,10 @@ import sys
 from collections import deque
 
 import network
+
+# Borderless window snapped to top-left of primary display.
+# Must be set BEFORE pygame.init() so SDL picks it up.
+os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")
 
 pygame.init()
 
@@ -31,8 +33,8 @@ SCREEN_W = DISPLAY.current_w
 SCREEN_H = DISPLAY.current_h
 
 # windowed mode: fit in screen with a small margin
-W = SCREEN_W - 40
-H = SCREEN_H - 80
+W = SCREEN_W
+H = SCREEN_H
 
 # cell size to fit the maze inside (W - PANEL_W) x H
 CELL = max(8, min((W - PANEL_W) // COLS, H // ROWS))
@@ -433,9 +435,10 @@ class ToggleButton:
 # ── game ───────────────────────────────────────────────────────────────────────
 class Game:
     def __init__(self):
-        # Windowed mode
-        self.surf  = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("VOID MAZE v2.0")
+        # Borderless fullscreen: NOFRAME covers the whole screen without
+        # exclusive mode-change → no flicker on Alt-Tab, lower input lag.
+        self.surf  = pygame.display.set_mode((W, H), pygame.NOFRAME)
+        pygame.display.set_caption("VOID MAZE v2.1")
         self.clock = pygame.time.Clock()
 
         self.font_xl  = pygame.font.Font(None, 72)
