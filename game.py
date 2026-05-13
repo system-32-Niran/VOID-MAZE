@@ -1,6 +1,6 @@
 """
 VOID MAZE — v1.3
-Add gate (open by hold E), add portal, maze shift (random)
+Add panel toggle: MAZE SHIFT, HUNTER, PORTALS, GATES.
 """
 
 import pygame
@@ -12,19 +12,26 @@ from collections import deque
 pygame.init()
 
 # ── layout ────────────────────────────────────────────────────────────────────
-DISPLAY = pygame.display.Info()
+DISPLAY  = pygame.display.Info()
 SCREEN_W = DISPLAY.current_w
 SCREEN_H = DISPLAY.current_h
 
+PANEL_W = 320
+
+MAZE_PX = SCREEN_W - PANEL_W
+MAZE_PY = SCREEN_H
+
 _CELL = 32
-COLS = (SCREEN_W // _CELL)
+COLS = (MAZE_PX // _CELL)
 COLS = COLS if COLS % 2 == 1 else COLS - 1
-ROWS = (SCREEN_H // _CELL)
+ROWS = (MAZE_PY // _CELL)
 ROWS = ROWS if ROWS % 2 == 1 else ROWS - 1
 
-CELL = min(SCREEN_W // COLS, SCREEN_H // ROWS)
-W = COLS * CELL
-H = ROWS * CELL
+CELL   = min(MAZE_PX // COLS, MAZE_PY // ROWS)
+MAZE_W = COLS * CELL
+MAZE_H = ROWS * CELL
+W      = MAZE_W + PANEL_W
+H      = MAZE_H
 
 FPS                  = 60
 MOVE_DELAY           = 0.11
@@ -36,6 +43,7 @@ GATE_OPEN_TIME       = 1.2
 BLACK             = (0, 0, 0)
 CYAN              = (0, 255, 200)
 WHITE             = (255, 255, 255)
+PANEL_BG          = (8, 12, 24)
 GATE_COLOR_CLOSED = (180, 120, 0)
 GATE_COLOR_OPEN   = (80, 255, 80)
 
@@ -145,8 +153,8 @@ def cell_xy(r, c):
 # ── gate ──────────────────────────────────────────────────────────────────────
 class Gate:
     def __init__(self, r, c):
-        self.r = r
-        self.c = c
+        self.r         = r
+        self.c         = c
         self.is_open   = False
         self._progress = {}
 
@@ -156,7 +164,7 @@ class Gate:
     def update(self, dt, entity_id, pressing):
         prev = self._progress.get(entity_id, 0.0)
         self._progress[entity_id] = min(GATE_OPEN_TIME, prev + dt) if pressing else 0.0
-        was_open  = self.is_open
+        was_open     = self.is_open
         self.is_open = any(v >= GATE_OPEN_TIME for v in self._progress.values())
         return (not was_open) and self.is_open
 
@@ -177,9 +185,10 @@ class Gate:
 
         prog = self.player_progress()
         if prog > 0 and not self.is_open:
-            frac = prog / GATE_OPEN_TIME
+            frac     = prog / GATE_OPEN_TIME
             arc_rect = pygame.Rect(x - CELL//2 + 2, y - CELL//2 + 2, CELL - 4, CELL - 4)
-            pygame.draw.arc(surf, (255, 220, 0), arc_rect, math.pi / 2, math.pi / 2 + math.tau * frac, 3)
+            pygame.draw.arc(surf, (255, 220, 0), arc_rect,
+                            math.pi / 2, math.pi / 2 + math.tau * frac, 3)
 
         if self.is_open:
             s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
@@ -187,7 +196,7 @@ class Gate:
             surf.blit(s, (self.c * CELL, self.r * CELL))
 
 
-# ── portal ─────────────────────────────────────────────────────────────────────
+# ── portal ────────────────────────────────────────────────────────────────────
 class Portal:
     def __init__(self, r, c, pair_idx, color):
         self.r        = r
@@ -203,7 +212,8 @@ class Portal:
         for ring in range(4, 0, -1):
             radius = size * ring // 4
             glow   = pygame.Surface((radius * 2 + 4, radius * 2 + 4), pygame.SRCALPHA)
-            pygame.draw.circle(glow, (*self.color, int(40 * ring * pulse)), (radius + 2, radius + 2), radius, 2)
+            pygame.draw.circle(glow, (*self.color, int(40 * ring * pulse)),
+                               (radius + 2, radius + 2), radius, 2)
             surf.blit(glow, (x - radius - 2, y - radius - 2))
         pygame.draw.circle(surf, self.color, (x, y), max(6, size // 2))
         pygame.draw.circle(surf, WHITE,      (x, y), max(3, size // 5))
@@ -212,8 +222,8 @@ class Portal:
 # ── player ────────────────────────────────────────────────────────────────────
 class Player:
     def __init__(self, r, c):
-        self.r = r
-        self.c = c
+        self.r     = r
+        self.c     = c
         self.trail = deque(maxlen=16)
 
     def draw(self, surf):
@@ -235,8 +245,8 @@ class Player:
 # ── hunter ────────────────────────────────────────────────────────────────────
 class Hunter:
     def __init__(self, r, c):
-        self.r = r
-        self.c = c
+        self.r     = r
+        self.c     = c
         self.trail = deque(maxlen=12)
 
     def draw(self, surf):
@@ -251,15 +261,49 @@ class Hunter:
         pygame.draw.circle(surf, (255, 60, 60), (x, y), int(CELL * 0.30))
 
 
+# ── toggle button ─────────────────────────────────────────────────────────────
+class ToggleButton:
+    W = 260
+    H = 38
+
+    def __init__(self, label, x, y, state=True):
+        self.label = label
+        self.rect  = pygame.Rect(x, y, self.W, self.H)
+        self.state = state
+
+    def handle_click(self, pos):
+        if self.rect.collidepoint(pos):
+            self.state = not self.state
+            return True
+        return False
+
+    def draw(self, surf, font):
+        color = (0, 180, 80) if self.state else (120, 30, 30)
+        pygame.draw.rect(surf, color, self.rect, border_radius=6)
+        pygame.draw.rect(surf, WHITE, self.rect, 1, border_radius=6)
+        tag  = "ON" if self.state else "OFF"
+        text = font.render(f"{self.label}  [{tag}]", True, WHITE)
+        surf.blit(text, (self.rect.x + 10, self.rect.y + (self.H - text.get_height()) // 2))
+
+
 # ── game ──────────────────────────────────────────────────────────────────────
 class Game:
     def __init__(self):
         self.surf  = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("VOID MAZE v1.3")
+        pygame.display.set_caption("VOID MAZE v1.4")
         self.clock = pygame.time.Clock()
+
         self.font_xl  = pygame.font.Font(None, 72)
+        self.font_lg  = pygame.font.Font(None, 54)
         self.font_med = pygame.font.Font(None, 40)
         self.font_sm  = pygame.font.Font(None, 30)
+
+        bx = MAZE_W + 30
+        self.btn_maze    = ToggleButton("MAZE SHIFT", bx, H - 208, state=True)
+        self.btn_hunter  = ToggleButton("HUNTER",     bx, H - 160, state=True)
+        self.btn_portals = ToggleButton("PORTALS",    bx, H - 112, state=True)
+        self.btn_gates   = ToggleButton("GATES",      bx, H -  64, state=True)
+
         self.state = "title"
         self.reset()
 
@@ -314,6 +358,10 @@ class Game:
                 self.gates.append(Gate(r, c))
                 count += 1
 
+    def active_gates(self):
+        """Trả về danh sách gates nếu tính năng đang bật, ngược lại rỗng."""
+        return self.gates if self.btn_gates.state else []
+
     def shift_maze(self):
         pr, pc = self.player.r, self.player.c
         hr, hc = self.hunter.r, self.hunter.c
@@ -322,12 +370,14 @@ class Game:
         self.portals = []
         self.build_gates()
         self.build_portals()
-        self.player.r, self.player.c = nearest_free(self.walls, pr, pc, self.gates)
-        self.hunter.r, self.hunter.c = nearest_free(self.walls, hr, hc, self.gates)
+        self.player.r, self.player.c = nearest_free(self.walls, pr, pc, self.active_gates())
+        self.hunter.r, self.hunter.c = nearest_free(self.walls, hr, hc, self.active_gates())
         self.player.trail.clear()
         self.hunter.trail.clear()
 
     def update_gates(self, dt, e_pressed):
+        if not self.btn_gates.state:
+            return
         for gate in self.gates:
             player_adj = gate.is_adjacent(self.player.r, self.player.c)
             gate.update(dt, "player", e_pressed and player_adj)
@@ -335,12 +385,14 @@ class Game:
             gate.update(dt, "hunter", hunter_adj)
 
     def update_hunter(self, dt):
+        if not self.btn_hunter.state:
+            return
         self.hunter_timer += dt
         if self.hunter_timer < HUNTER_DELAY:
             return
         self.hunter_timer = 0
         path = bfs(self.walls, self.hunter.r, self.hunter.c,
-                   self.player.r, self.player.c, self.gates)
+                   self.player.r, self.player.c, self.active_gates())
         if path:
             self.hunter.trail.append((self.hunter.r, self.hunter.c))
             self.hunter.r, self.hunter.c = path[0]
@@ -350,13 +402,14 @@ class Game:
     def try_move(self, dr, dc):
         nr = self.player.r + dr
         nc = self.player.c + dc
-        if is_wall(self.walls, nr, nc, self.gates):
+        if is_wall(self.walls, nr, nc, self.active_gates()):
             return
         self.player.trail.append((self.player.r, self.player.c))
         self.player.r = nr
         self.player.c = nc
         self.score += 1
-        self.check_portal()
+        if self.btn_portals.state:
+            self.check_portal()
         self.check_exit()
         self.check_caught()
 
@@ -364,8 +417,8 @@ class Game:
         for p in self.portals:
             if (p.r, p.c) == (self.player.r, self.player.c):
                 dest = self.portals[p.pair_idx]
-                self.player.r = dest.r
-                self.player.c = dest.c
+                self.player.r      = dest.r
+                self.player.c      = dest.c
                 self.score        += 15
                 self.portal_count += 1
                 return
@@ -380,9 +433,10 @@ class Game:
         if (self.player.r, self.player.c) == (self.hunter.r, self.hunter.c):
             self.state = "dead"
 
+    # ── drawing ───────────────────────────────────────────────────────────────
     def draw_maze(self):
         self.surf.fill(BLACK)
-        gate_cells = {(g.r, g.c) for g in self.gates}
+        gate_cells = {(g.r, g.c) for g in self.active_gates()}
         for r in range(ROWS):
             for c in range(COLS):
                 if self.walls[r][c] and (r, c) not in gate_cells:
@@ -398,21 +452,47 @@ class Game:
         pygame.draw.polygon(self.surf, WHITE, points)
 
     def draw_maze_timer_bar(self):
+        if not self.btn_maze.state:
+            return
         frac  = self.maze_timer / MAZE_CHANGE_INTERVAL
-        bar_w = int(W * frac)
-        pygame.draw.rect(self.surf, (0, 60, 100),  (0, 0, W, 4))
+        bar_w = int(MAZE_W * frac)
+        pygame.draw.rect(self.surf, (0, 60, 100),  (0, 0, MAZE_W, 4))
         pygame.draw.rect(self.surf, (0, 200, 255), (0, 0, bar_w, 4))
 
-    def draw_hud(self):
-        secs  = max(0, MAZE_CHANGE_INTERVAL - self.maze_timer)
-        text  = f"LEVEL {self.level}   SCORE {self.score}   PORTALS {self.portal_count}   SHIFT {secs:.1f}s"
-        lv    = self.font_sm.render(text, True, CYAN)
-        self.surf.blit(lv, (12, 10))
+    def draw_panel(self):
+        pygame.draw.rect(self.surf, PANEL_BG, (MAZE_W, 0, PANEL_W, H))
+        pygame.draw.line(self.surf, (0, 120, 200), (MAZE_W, 0), (MAZE_W, H), 3)
+
+        title = self.font_lg.render("VOID MAZE", True, CYAN)
+        self.surf.blit(title, (MAZE_W + PANEL_W // 2 - title.get_width() // 2, 24))
+
+        stats = [
+            f"LEVEL   : {self.level}",
+            f"SCORE   : {self.score}",
+            f"PORTALS : {self.portal_count}",
+        ]
+        for i, text in enumerate(stats):
+            s = self.font_med.render(text, True, WHITE)
+            self.surf.blit(s, (MAZE_W + 24, 110 + i * 48))
+
+        if self.btn_maze.state:
+            secs  = max(0, MAZE_CHANGE_INTERVAL - self.maze_timer)
+            label = self.font_sm.render(f"SHIFT IN : {secs:.1f}s", True, (0, 200, 255))
+            self.surf.blit(label, (MAZE_W + 24, 110 + 3 * 48))
+
+        hint_y = H - 260
+        hint   = self.font_sm.render("HOLD E : open gate", True, (160, 160, 160))
+        self.surf.blit(hint, (MAZE_W + 24, hint_y))
+
+        self.btn_maze.draw(self.surf,    self.font_sm)
+        self.btn_hunter.draw(self.surf,  self.font_sm)
+        self.btn_portals.draw(self.surf, self.font_sm)
+        self.btn_gates.draw(self.surf,   self.font_sm)
 
     def draw_overlay(self, title, lines, color):
         ow, oh = 700, 320
-        ox = W // 2 - ow // 2
-        oy = H // 2 - oh // 2
+        ox = MAZE_W // 2 - ow // 2
+        oy = MAZE_H // 2 - oh // 2
         overlay = pygame.Surface((ow, oh), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 220))
         self.surf.blit(overlay, (ox, oy))
@@ -423,6 +503,7 @@ class Game:
             ls = self.font_med.render(line, True, WHITE)
             self.surf.blit(ls, (ox + ow // 2 - ls.get_width() // 2, oy + 120 + i * 40))
 
+    # ── main loop ─────────────────────────────────────────────────────────────
     def run(self):
         move_keys = {
             pygame.K_UP:    (-1,  0), pygame.K_w:     (-1,  0),
@@ -445,6 +526,11 @@ class Game:
                     elif self.state == "dead":
                         self.reset()
                         self.state = "play"
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self.btn_maze.handle_click(event.pos)
+                    self.btn_hunter.handle_click(event.pos)
+                    self.btn_portals.handle_click(event.pos)
+                    self.btn_gates.handle_click(event.pos)
 
             if self.state == "play":
                 pressed = pygame.key.get_pressed()
@@ -461,21 +547,30 @@ class Game:
                 self.update_gates(dt, e_held)
                 self.update_hunter(dt)
 
-                self.maze_timer += dt
-                if self.maze_timer >= MAZE_CHANGE_INTERVAL:
-                    self.maze_timer = 0.0
-                    self.shift_maze()
+                if self.btn_maze.state:
+                    self.maze_timer += dt
+                    if self.maze_timer >= MAZE_CHANGE_INTERVAL:
+                        self.maze_timer = 0.0
+                        self.shift_maze()
 
             self.draw_maze()
-            for g in self.gates:
-                g.draw(self.surf)
-            t = pygame.time.get_ticks() / 1000
-            for p in self.portals:
-                p.draw(self.surf, t)
+
+            if self.btn_gates.state:
+                for g in self.gates:
+                    g.draw(self.surf)
+
+            if self.btn_portals.state:
+                t = pygame.time.get_ticks() / 1000
+                for p in self.portals:
+                    p.draw(self.surf, t)
+
             self.draw_exit()
             self.player.draw(self.surf)
-            self.hunter.draw(self.surf)
-            self.draw_hud()
+
+            if self.btn_hunter.state:
+                self.hunter.draw(self.surf)
+
+            self.draw_panel()
             self.draw_maze_timer_bar()
 
             if self.state == "title":
