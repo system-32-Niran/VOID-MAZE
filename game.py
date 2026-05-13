@@ -1,14 +1,14 @@
 """
-VOID MAZE — v2.3
-Changes from v2.2:
-  - Gate bar is now oriented along the wall direction it interrupts:
-      • vertical bar for column-walls (walls above + below)
-      • horizontal bar for row-walls (walls left + right)
-  - build_gates() picks only clean 2-case doors (no T-junctions or corners)
+fix bug other player cannot open gate and sync movement between host and client
+Nguyên nhân gốc rễ (Bug logic mạng): Game của bạn chạy ở tốc độ 60 FPS (60 khung hình/giây), nhưng máy khách (client/người chơi khác) chỉ gửi tín hiệu phím bấm lên host 30 lần/giây qua mạng. Trước đây, sau mỗi khung hình, host lại tiến hành xoá sạch bộ nhớ phím bấm (self.mp_pending_input = {}). Điều này dẫn đến việc phím bấm của người chơi khác bị rớt nhịp (cứ 1 khung hình có phím thì khung tiếp theo lại bị coi là nhả phím).
+
+Host đẩy tín hiệu cục bộ của chính mình lên mỗi khung hình nên không bị ảnh hưởng.
+Người chơi khác bị coi là "nhấp nhả" liên tục nên tốc độ sửa máy, mở cổng (Gate) và di chuyển bị chậm đi đúng một nửa hoặc hoàn toàn bị gián đoạn. Việc mở cổng yêu cầu giữ lỳ nút E liên tục trong 0.5s, vì tín hiệu bị ngắt quãng nên người chơi khác không bao giờ có thể mở được cổng.
+Cách tôi đã sửa: Tôi bỏ đi dòng lệnh xoá bộ nhớ phím. Bây giờ trạng thái phím (e_held, dr, dc) của mỗi người chơi sẽ được giữ nguyên cho đến khi có gói tin mạng mới từ người đó gửi đến báo rằng họ đã thả phím ra.
 """
 
 import os
-import pygame
+import pygame  
 import math
 import random
 import sys
@@ -1321,8 +1321,7 @@ class Game:
                 self.mp_players[pid]["alive"] = False
 
         # 2. host's own input as player 0
-        if 0 not in self.mp_pending_input:
-            self.mp_pending_input[0] = self.mp_local_input
+        self.mp_pending_input[0] = self.mp_local_input
 
         # 3. per-player movement (imprisoned or carried players can't move)
         for p in self.mp_players:
@@ -1427,7 +1426,7 @@ class Game:
                 return
 
         # 6. clear pending inputs
-        self.mp_pending_input = {}
+        # self.mp_pending_input = {} # REMOVED: keep input states to sync speeds
 
         # 7. broadcast state ~30Hz
         self.mp_broadcast_timer += dt
