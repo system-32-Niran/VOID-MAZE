@@ -298,8 +298,9 @@ class Gate:
 GEN_REPAIR_TIME    = 10.0   # seconds of held E to finish a generator
 WAREHOUSE_IMPRISON = 30.0   # seconds before an imprisoned runner is eliminated
 DBD_MATCH_LENGTH   = 7 * 60 # 7 minutes
-DBD_GEN_COUNT      = 5
+DBD_GEN_COUNT      = 4
 DBD_WAREHOUSE_COUNT = 3
+HUNTER_CARRY_TIME   = 10.0   # seconds the hunter can carry a runner before they escape
 
 
 class Generator:
@@ -1185,6 +1186,8 @@ class Game:
                     "id": i, "r": r, "c": c, "alive": True,
                     "role": role,
                     "imprisoned": False, "imprison_remaining": 0.0,
+                    "carried": False, "carry_timer": 0.0,
+                    "carrying_pid": None, "catch_cooldown": 0.0,
                 })
         else:  # dbd
             self.exit_unlocked = False
@@ -1207,6 +1210,8 @@ class Game:
                     "id": i, "r": r, "c": c, "alive": True,
                     "role": role,
                     "imprisoned": False, "imprison_remaining": 0.0,
+                    "carried": False, "carry_timer": 0.0,
+                    "carrying_pid": None, "catch_cooldown": 0.0,
                 })
             # place generators + warehouses on free cells
             taken = [(p["r"], p["c"]) for p in self.mp_players]
@@ -1319,9 +1324,9 @@ class Game:
         if 0 not in self.mp_pending_input:
             self.mp_pending_input[0] = self.mp_local_input
 
-        # 3. per-player movement (imprisoned players can't move)
+        # 3. per-player movement (imprisoned or carried players can't move)
         for p in self.mp_players:
-            if not p["alive"] or p.get("imprisoned"):
+            if not p["alive"] or p.get("imprisoned") or p.get("carried"):
                 continue
             pid = p["id"]
             self.mp_move_timers[pid] += dt
@@ -1367,7 +1372,7 @@ class Game:
         for gate in self.gates:
             holding = False
             for p in self.mp_players:
-                if p["alive"] and not p.get("imprisoned") \
+                if p["alive"] and not p.get("imprisoned") and not p.get("carried") \
                    and gate.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
                     if inp.get("e_held"):
@@ -1446,7 +1451,7 @@ class Game:
                 continue
             ticking = False
             for p in self.mp_players:
-                if p["role"] != "runner" or not p["alive"] or p.get("imprisoned"):
+                if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
                     continue
                 if gen.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
@@ -1463,21 +1468,55 @@ class Game:
         if not self.exit_unlocked and all(g.completed for g in self.mp_generators):
             self.exit_unlocked = True
 
-        # hunter catches: hunter shares cell with a runner → imprison
+        # hunter catches: hunter shares cell with a runner
         hunter = next((p for p in self.mp_players if p["role"] == "hunter"), None)
         if hunter and hunter["alive"]:
-            for p in self.mp_players:
-                if p["role"] != "runner" or not p["alive"] or p.get("imprisoned"):
-                    continue
-                if (p["r"], p["c"]) == (hunter["r"], hunter["c"]):
-                    self._imprison_runner(p)
+            if hunter.get("catch_cooldown", 0) > 0:
+                hunter["catch_cooldown"] -= dt
+            elif hunter.get("carrying_pid") is None:
+                for p in self.mp_players:
+                    if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
+                        continue
+                    if (p["r"], p["c"]) == (hunter["r"], hunter["c"]):
+                        hunter["carrying_pid"] = p["id"]
+                        p["carried"] = True
+                        p["carry_timer"] = HUNTER_CARRY_TIME
+                        break
+            else:
+                carried_runner = next((p for p in self.mp_players if p["id"] == hunter["carrying_pid"]), None)
+                if carried_runner:
+                    carried_runner["carry_timer"] -= dt
+                    carried_runner["r"] = hunter["r"]
+                    carried_runner["c"] = hunter["c"]
+
+                    put_in_wh = None
+                    for w in self.mp_warehouses:
+                        if w.imprisoned_pid is None and w.is_adjacent(hunter["r"], hunter["c"]):
+                            put_in_wh = w
+                            break
+
+                    if put_in_wh:
+                        carried_runner["carried"] = False
+                        hunter["carrying_pid"] = None
+                        self._imprison_runner_in(carried_runner, put_in_wh)
+                    elif carried_runner["carry_timer"] <= 0:
+                        carried_runner["carried"] = False
+                        hunter["carrying_pid"] = None
+                        hunter["catch_cooldown"] = 2.0
+                        for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+                            nr, nc = hunter["r"] + dr, hunter["c"] + dc
+                            if not is_wall(self.walls, nr, nc, self.gates):
+                                carried_runner["r"], carried_runner["c"] = nr, nc
+                                break
+                else:
+                    hunter["carrying_pid"] = None
 
         # rescue: any free runner adjacent to a warehouse holding an imprisoned one
         for w in self.mp_warehouses:
             if w.imprisoned_pid is None:
                 continue
             for p in self.mp_players:
-                if p["role"] != "runner" or not p["alive"] or p.get("imprisoned"):
+                if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
                     continue
                 if w.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
@@ -1502,6 +1541,12 @@ class Game:
         if runners and all(not p["alive"] for p in runners):
             self._end_dbd("hunter")
             return
+
+    def _imprison_runner_in(self, runner, w):
+        runner["r"], runner["c"] = w.r, w.c
+        runner["imprisoned"] = True
+        runner["imprison_remaining"] = WAREHOUSE_IMPRISON
+        w.imprisoned_pid = runner["id"]
 
     def _imprison_runner(self, runner):
         # find a warehouse without an imprisoned player
@@ -1656,15 +1701,22 @@ class Game:
             x, y   = cell_xy(p["r"], p["c"])
             radius = int(CELL * 0.30)
 
-            # imprisoned runners: draw smaller + a circle outline
-            if p.get("imprisoned"):
+            # imprisoned or carried runners: draw smaller + a circle outline
+            if p.get("imprisoned") or p.get("carried"):
                 pygame.draw.circle(self.surf, color, (x, y), radius // 2)
-                pygame.draw.circle(self.surf, (200, 200, 200), (x, y), radius, 2)
+                if p.get("imprisoned"):
+                    pygame.draw.circle(self.surf, (200, 200, 200), (x, y), radius, 2)
+                    frac = max(0.0, p.get("imprison_remaining", 0)) / WAREHOUSE_IMPRISON
+                    arc_color = (255, 80, 80)
+                else:
+                    pygame.draw.circle(self.surf, (255, 220, 0), (x, y), radius, 2)
+                    frac = max(0.0, p.get("carry_timer", 0)) / HUNTER_CARRY_TIME
+                    arc_color = (255, 220, 0)
+
                 # remaining-time arc
-                frac = max(0.0, p.get("imprison_remaining", 0)) / WAREHOUSE_IMPRISON
                 arc_rect = pygame.Rect(x - radius - 4, y - radius - 4,
                                        (radius + 4) * 2, (radius + 4) * 2)
-                pygame.draw.arc(self.surf, (255, 80, 80), arc_rect,
+                pygame.draw.arc(self.surf, arc_color, arc_rect,
                                 -math.pi / 2,
                                 -math.pi / 2 + math.tau * frac, 3)
             else:
@@ -1734,6 +1786,8 @@ class Game:
                 status = "ELIMINATED"
             elif p.get("imprisoned"):
                 status = f"IMPRISONED {p['imprison_remaining']:.0f}s"
+            elif p.get("carried"):
+                status = f"CARRIED {p['carry_timer']:.1f}s"
             else:
                 status = "ALIVE"
             text = self.font_sm.render(f"{label}  -  {status}", True, color)
@@ -1915,11 +1969,23 @@ class Game:
                                 self.start_client_mode(self.mp_text_input)
                         elif event.key == pygame.K_BACKSPACE:
                             self.mp_text_input = self.mp_text_input[:-1]
+                        elif event.key == pygame.K_v and (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                            try:
+                                if not pygame.scrap.get_init():
+                                    pygame.scrap.init()
+                                text = pygame.scrap.get(pygame.SCRAP_TEXT)
+                                if text:
+                                    text = text.decode("utf-8", errors="ignore").strip("\x00")
+                                    valid = "".join(c for c in text if c.isdigit() or c in ".:" or c.isalpha() or c == "-")
+                                    self.mp_text_input = (self.mp_text_input + valid)[:40]
+                            except Exception:
+                                pass
                         else:
                             ch = event.unicode
-                            if ch and (ch.isdigit() or ch in ".:" or ch.isalpha() or ch == "-"):
-                                if len(self.mp_text_input) < 40:
-                                    self.mp_text_input += ch
+                            if not (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                                if ch and (ch.isdigit() or ch in ".:" or ch.isalpha() or ch == "-"):
+                                    if len(self.mp_text_input) < 40:
+                                        self.mp_text_input += ch
 
                     elif self.state == "mp_end":
                         if event.key in (pygame.K_RETURN, pygame.K_SPACE):
