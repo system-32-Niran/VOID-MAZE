@@ -1,8 +1,10 @@
 """
-VOID MAZE — v2.1
-Changes from v2.0:
-  - Borderless fullscreen for all players: NOFRAME + SDL_VIDEO_WINDOW_POS="0,0"
-    so the window covers the whole screen without exclusive fullscreen mode-change.
+VOID MAZE — v2.2
+Changes from v2.1:
+  - Gate mechanic reworked:
+      • Hold E for 0.5s → opens the gate (with progress arc)
+      • Press E (single press) → closes an already-open gate instantly
+    Players must release E between actions so the gate doesn't oscillate.
 """
 
 import os
@@ -53,7 +55,7 @@ FPS = 60
 MAZE_CHANGE_INTERVAL = 20.0
 
 GATE_COUNT = 6
-GATE_OPEN_TIME    = 1.2   # seconds to hold E to open a gate (old logic)
+GATE_HOLD_TIME    = 0.5   # seconds to hold E to open a gate
 GATE_COLOR_CLOSED = (180, 120, 0)
 GATE_COLOR_OPEN   = (80, 255, 80)
 
@@ -201,34 +203,53 @@ def cell_xy(r, c):
 
 # ── gate ──────────────────────────────────────────────────────────────────────
 class Gate:
-    """A wall cell that can be opened by holding E for GATE_OPEN_TIME seconds.
-
-    Once open, stays open until Gate.close() is called (e.g. on maze shift).
-    Progress resets if the player releases E before the timer is full.
+    """A wall cell with new toggle mechanic (v2.2):
+      - Closed → hold E for GATE_HOLD_TIME to open (progress arc shown)
+      - Open → single press E closes it instantly
+    Must release E between actions to prevent oscillation (_triggered flag).
     """
 
     def __init__(self, r, c):
-        self.r         = r
-        self.c         = c
-        self.is_open   = False
-        self._progress = {}   # entity_id → accumulated hold time
+        self.r = r
+        self.c = c
+        self.is_open = False
+        self._hold = 0.0          # accumulated hold time this press
+        self._triggered = False   # already toggled this hold? must release to re-arm
 
     def is_adjacent(self, r, c):
         return abs(r - self.r) + abs(c - self.c) == 1
 
-    def update(self, dt, entity_id, pressing):
-        prev = self._progress.get(entity_id, 0.0)
-        self._progress[entity_id] = min(GATE_OPEN_TIME, prev + dt) if pressing else 0.0
-        was_open     = self.is_open
-        self.is_open = any(v >= GATE_OPEN_TIME for v in self._progress.values())
-        return (not was_open) and self.is_open
+    def update(self, dt, holding):
+        """holding : bool — player adjacent AND pressing E."""
+        if not self.is_open:
+            # closed → hold to open
+            if holding and not self._triggered:
+                self._hold += dt
+                if self._hold >= GATE_HOLD_TIME:
+                    self.is_open    = True
+                    self._triggered = True
+                    self._hold      = 0.0
+            elif not holding:
+                self._hold      = 0.0
+                self._triggered = False
+        else:
+            # open → fresh press closes instantly
+            if holding and not self._triggered:
+                self.is_open    = False
+                self._triggered = True
+                self._hold      = 0.0
+            elif not holding:
+                self._triggered = False
+                self._hold      = 0.0
 
     def close(self):
-        self._progress = {}
-        self.is_open   = False
+        self.is_open    = False
+        self._hold      = 0.0
+        self._triggered = False
 
     def player_progress(self):
-        return self._progress.get("player", 0.0)
+        """Fraction 0..1 of hold progress (for drawing the arc)."""
+        return self._hold / GATE_HOLD_TIME if not self.is_open else 0.0
 
     def draw(self, surf, walls=None):
         x, y  = cell_xy(self.r, self.c)
@@ -238,9 +259,9 @@ class Gate:
         rect  = pygame.Rect(x - bar_w // 2, y - bar_h // 2, bar_w, bar_h)
         pygame.draw.rect(surf, color, rect, border_radius=3)
 
-        prog = self.player_progress()
-        if prog > 0 and not self.is_open:
-            frac     = prog / GATE_OPEN_TIME
+        # progress arc while holding to open
+        if self._hold > 0 and not self._triggered and not self.is_open:
+            frac     = self._hold / GATE_HOLD_TIME
             arc_rect = pygame.Rect(x - CELL//2 + 2, y - CELL//2 + 2, CELL - 4, CELL - 4)
             pygame.draw.arc(surf, (255, 220, 0), arc_rect,
                             math.pi / 2, math.pi / 2 + math.tau * frac, 3)
@@ -438,7 +459,7 @@ class Game:
         # Borderless fullscreen: NOFRAME covers the whole screen without
         # exclusive mode-change → no flicker on Alt-Tab, lower input lag.
         self.surf  = pygame.display.set_mode((W, H), pygame.NOFRAME)
-        pygame.display.set_caption("VOID MAZE v2.1")
+        pygame.display.set_caption("VOID MAZE v2.2")
         self.clock = pygame.time.Clock()
 
         self.font_xl  = pygame.font.Font(None, 72)
@@ -675,8 +696,8 @@ class Game:
     # ── gate logic ────────────────────────────────────────────────────────────
     def update_gates(self, dt, e_held):
         for gate in self.gates:
-            player_adj = gate.is_adjacent(self.player.r, self.player.c)
-            gate.update(dt, "player", e_held and player_adj)
+            adjacent = gate.is_adjacent(self.player.r, self.player.c)
+            gate.update(dt, e_held and adjacent)
 
     # ── checks ────────────────────────────────────────────────────────────────
     def check_portal(self):
@@ -1315,16 +1336,17 @@ class Game:
                             self.server.broadcast({"type": "end", "winner": "runners"})
                             return
 
-        # 4. gates — any adjacent alive player holding E accumulates progress
+        # 4. gates — any adjacent alive player holding E drives toggle
         for gate in self.gates:
+            holding = False
             for p in self.mp_players:
                 if p["alive"] and not p.get("imprisoned") \
                    and gate.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
-                    pressing = bool(inp.get("e_held"))
-                    gate.update(dt, f"player_{p['id']}", pressing)
-                else:
-                    gate.update(dt, f"player_{p['id']}", False)
+                    if inp.get("e_held"):
+                        holding = True
+                        break
+            gate.update(dt, holding)
 
         # 5. mode-specific logic
         if self.mp_mode == "escape":
