@@ -1,10 +1,10 @@
 """
-VOID MAZE — v2.2
-Changes from v2.1:
-  - Gate mechanic reworked:
-      • Hold E for 0.5s → opens the gate (with progress arc)
-      • Press E (single press) → closes an already-open gate instantly
-    Players must release E between actions so the gate doesn't oscillate.
+VOID MAZE — v2.3
+Changes from v2.2:
+  - Gate bar is now oriented along the wall direction it interrupts:
+      • vertical bar for column-walls (walls above + below)
+      • horizontal bar for row-walls (walls left + right)
+  - build_gates() picks only clean 2-case doors (no T-junctions or corners)
 """
 
 import os
@@ -16,8 +16,8 @@ from collections import deque
 
 import network
 
-# Borderless window snapped to top-left of primary display.
-# Must be set BEFORE pygame.init() so SDL picks it up.
+# Place the borderless window at the top-left of the primary display.
+# Must be set BEFORE pygame.init() / display.set_mode for SDL to pick it up.
 os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")
 
 pygame.init()
@@ -26,7 +26,7 @@ pygame.init()
 # Maze grid is FIXED across all players (so multiplayer maps are interchangeable).
 # CELL size is computed per-machine so the maze scales to each player's screen.
 COLS = 51   # must be odd
-ROWS = 35   # must be odd
+ROWS = 35   # must be odd (bumped from 27 to use vertical screen space)
 
 PANEL_W = 320
 
@@ -34,12 +34,12 @@ DISPLAY = pygame.display.Info()
 SCREEN_W = DISPLAY.current_w
 SCREEN_H = DISPLAY.current_h
 
-# windowed mode: fit in screen with a small margin
+# total window = whole screen (fullscreen)
 W = SCREEN_W
 H = SCREEN_H
 
-# cell size to fit the maze inside (W - PANEL_W) x H
-CELL = max(8, min((W - PANEL_W) // COLS, H // ROWS))
+# cell size to fit the maze inside (SCREEN_W - PANEL_W) x SCREEN_H
+CELL = max(8, min((SCREEN_W - PANEL_W) // COLS, SCREEN_H // ROWS))
 
 MAZE_W = COLS * CELL
 MAZE_H = ROWS * CELL
@@ -55,7 +55,7 @@ FPS = 60
 MAZE_CHANGE_INTERVAL = 20.0
 
 GATE_COUNT = 6
-GATE_HOLD_TIME    = 0.5   # seconds to hold E to open a gate
+GATE_HOLD_TIME    = 0.5   # seconds to hold E to toggle a gate
 GATE_COLOR_CLOSED = (180, 120, 0)
 GATE_COLOR_OPEN   = (80, 255, 80)
 
@@ -203,26 +203,32 @@ def cell_xy(r, c):
 
 # ── gate ──────────────────────────────────────────────────────────────────────
 class Gate:
-    """A wall cell with new toggle mechanic (v2.2):
-      - Closed → hold E for GATE_HOLD_TIME to open (progress arc shown)
-      - Open → single press E closes it instantly
-    Must release E between actions to prevent oscillation (_triggered flag).
+    """A wall cell. Player holds E nearby for GATE_HOLD_TIME to toggle open/closed.
+
+    Once toggled, the gate stays in its new state until the player toggles it
+    again. Hunter cannot toggle gates — but Hunter CAN walk through any gate
+    the player has left open. This makes gates a strategic tool.
     """
 
     def __init__(self, r, c):
         self.r = r
         self.c = c
         self.is_open = False
-        self._hold = 0.0          # accumulated hold time this press
-        self._triggered = False   # already toggled this hold? must release to re-arm
+        self._hold = 0.0   # seconds player has been holding E this press
+        self._triggered = False   # already toggled during this hold? (must release to re-arm)
 
     def is_adjacent(self, r, c):
         return abs(r - self.r) + abs(c - self.c) == 1
 
     def update(self, dt, holding):
-        """holding : bool — player adjacent AND pressing E."""
+        """Opening requires holding E for GATE_HOLD_TIME (with progress arc).
+        Closing an already-open gate is INSTANT on a fresh press — the player
+        just needs to release E between actions so we don't oscillate.
+
+        holding : bool — at least one player is adjacent AND pressing E
+        """
         if not self.is_open:
-            # closed → hold to open
+            # closed → need to hold to open
             if holding and not self._triggered:
                 self._hold += dt
                 if self._hold >= GATE_HOLD_TIME:
@@ -233,7 +239,7 @@ class Gate:
                 self._hold      = 0.0
                 self._triggered = False
         else:
-            # open → fresh press closes instantly
+            # open → fresh press closes it instantly
             if holding and not self._triggered:
                 self.is_open    = False
                 self._triggered = True
@@ -243,30 +249,46 @@ class Gate:
                 self._hold      = 0.0
 
     def close(self):
-        self.is_open    = False
-        self._hold      = 0.0
+        self.is_open = False
+        self._hold = 0.0
         self._triggered = False
 
-    def player_progress(self):
-        """Fraction 0..1 of hold progress (for drawing the arc)."""
-        return self._hold / GATE_HOLD_TIME if not self.is_open else 0.0
-
-    def draw(self, surf, walls=None):
-        x, y  = cell_xy(self.r, self.c)
+    def draw(self, surf, walls):
+        x, y = cell_xy(self.r, self.c)
         color = GATE_COLOR_OPEN if self.is_open else GATE_COLOR_CLOSED
-        bar_w = CELL - 4
-        bar_h = max(4, CELL // 5)
-        rect  = pygame.Rect(x - bar_w // 2, y - bar_h // 2, bar_w, bar_h)
+
+        # orient the bar along the wall segment it interrupts:
+        #   walls above + below → vertical bar (column-style wall)
+        #   walls left + right  → horizontal bar (row-style wall)
+        has_above = self.r > 0          and walls[self.r - 1][self.c]
+        has_below = self.r < ROWS - 1   and walls[self.r + 1][self.c]
+        has_left  = self.c > 0          and walls[self.r][self.c - 1]
+        has_right = self.c < COLS - 1   and walls[self.r][self.c + 1]
+
+        thin = max(4, CELL // 5)
+        long_ = CELL - 4
+        if has_above and has_below and not (has_left and has_right):
+            bar_w, bar_h = thin, long_
+        elif has_left and has_right and not (has_above and has_below):
+            bar_w, bar_h = long_, thin
+        elif has_above and has_below:
+            bar_w, bar_h = thin, long_
+        else:
+            bar_w, bar_h = long_, thin
+
+        rect = pygame.Rect(x - bar_w // 2, y - bar_h // 2, bar_w, bar_h)
         pygame.draw.rect(surf, color, rect, border_radius=3)
 
-        # progress arc while holding to open
+        # progress arc while player is holding (only relevant while closed)
         if self._hold > 0 and not self._triggered and not self.is_open:
-            frac     = self._hold / GATE_HOLD_TIME
-            arc_rect = pygame.Rect(x - CELL//2 + 2, y - CELL//2 + 2, CELL - 4, CELL - 4)
+            frac = self._hold / GATE_HOLD_TIME
+            arc_rect = pygame.Rect(x - CELL // 2 + 2, y - CELL // 2 + 2,
+                                   CELL - 4, CELL - 4)
             pygame.draw.arc(surf, (255, 220, 0), arc_rect,
                             math.pi / 2, math.pi / 2 + math.tau * frac, 3)
 
         if self.is_open:
+            # faint green fill when open
             s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
             s.fill((80, 255, 80, 40))
             surf.blit(s, (self.c * CELL + MAZE_OX, self.r * CELL + MAZE_OY))
@@ -456,10 +478,11 @@ class ToggleButton:
 # ── game ───────────────────────────────────────────────────────────────────────
 class Game:
     def __init__(self):
-        # Borderless fullscreen: NOFRAME covers the whole screen without
-        # exclusive mode-change → no flicker on Alt-Tab, lower input lag.
+        # Borderless window at native resolution → Windows DWM GPU flip
+        # presentation (no exclusive fullscreen mode-change, no flicker on
+        # Alt-Tab, lower input lag than legacy FULLSCREEN).
         self.surf  = pygame.display.set_mode((W, H), pygame.NOFRAME)
-        pygame.display.set_caption("VOID MAZE v2.2")
+        pygame.display.set_caption("VOID MAZE")
         self.clock = pygame.time.Clock()
 
         self.font_xl  = pygame.font.Font(None, 72)
@@ -695,6 +718,10 @@ class Game:
 
     # ── gate logic ────────────────────────────────────────────────────────────
     def update_gates(self, dt, e_held):
+        """Each frame: each gate ticks its hold-progress if player is adjacent
+        and holding E. After GATE_HOLD_TIME the gate toggles open/closed and
+        stays that way until toggled again.
+        """
         for gate in self.gates:
             adjacent = gate.is_adjacent(self.player.r, self.player.c)
             gate.update(dt, e_held and adjacent)
