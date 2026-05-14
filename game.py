@@ -119,9 +119,136 @@ def build_maze(rows, cols):
     return walls
 
 
+# ── DBB (open map) constants ──────────────────────────────────────────────────
+DBB_COLS = 201
+DBB_ROWS = 141
+
+# Cell size for DBB is fixed (camera follows the local player; we render only
+# what's near the camera). Sized so ~28 cells fit across the play area, which
+# gives a comfortable hide-and-seek window at the chosen FOV radius.
+DBB_CELL = max(20, min((SCREEN_W - PANEL_W) // 28, SCREEN_H // 18))
+
+DBB_FOV_DEG       = 120     # full angular width of the front cone
+DBB_FRONT_RADIUS  = 14      # cells visible inside the front cone
+DBB_BACK_RADIUS   = 20       # cells faintly visible behind the player
+DBB_OBSTACLE_CLUSTERS = 240 # number of small wall clusters scattered across the map
+
+
+def build_dbb_map(rows, cols):
+    """Open arena bordered by walls, with small scattered cover clusters
+    (boxes / wall fragments). The interior starts empty so runners and hunter
+    have room to maneuver — clusters provide line-of-sight cover."""
+    walls = [[False] * cols for _ in range(rows)]
+    # solid border
+    for c in range(cols):
+        walls[0][c] = True
+        walls[rows - 1][c] = True
+    for r in range(rows):
+        walls[r][0] = True
+        walls[r][cols - 1] = True
+
+    shapes = [
+        [(0, 0)],
+        [(0, 0), (0, 1)],
+        [(0, 0), (1, 0)],
+        [(0, 0), (0, 1), (1, 0)],
+        [(0, 0), (0, 1), (1, 0), (1, 1)],
+        [(0, 0), (0, 1), (0, 2)],
+        [(0, 0), (1, 0), (2, 0)],
+        [(0, 0), (0, 1), (0, 2), (0, 3)],
+        [(0, 0), (0, 1), (1, 1), (1, 2)],
+        [(0, 0), (0, 1), (0, 2), (1, 1)],
+    ]
+    for _ in range(DBB_OBSTACLE_CLUSTERS):
+        cr = random.randint(2, rows - 4)
+        cc = random.randint(2, cols - 4)
+        shape = random.choice(shapes)
+        for dr, dc in shape:
+            r, c = cr + dr, cc + dc
+            if 0 < r < rows - 1 and 0 < c < cols - 1:
+                walls[r][c] = True
+    return walls
+
+
+def line_of_sight(walls, pr, pc, tr, tc):
+    """True if the straight line from (pr,pc) to (tr,tc) has no wall in between.
+    The endpoints themselves are not checked (so a wall AT the target is still
+    'visible' — useful for rendering wall cells the player can see)."""
+    dr = tr - pr
+    dc = tc - pc
+    steps = max(abs(dr), abs(dc))
+    if steps <= 1:
+        return True
+    for i in range(1, steps):
+        t = i / steps
+        rr = int(round(pr + dr * t))
+        cc = int(round(pc + dc * t))
+        if walls[rr][cc]:
+            return False
+    return True
+
+
+def _angle_diff(a, b):
+    """Shortest signed angular distance a - b, in (-pi, pi]."""
+    return (a - b + math.pi) % math.tau - math.pi
+
+
+def compute_dbb_fov(walls, pr, pc, facing_angle):
+    """Returns {(r, c): alpha 0..255} for cells visible from (pr, pc).
+
+    - Inside the front 120 deg cone: visible up to DBB_FRONT_RADIUS cells.
+      Alpha falls off with both distance and angular offset from the centerline.
+    - Behind the player: a small DBB_BACK_RADIUS halo with quick fade.
+    - Cells whose direct line from the player crosses a wall are hidden
+      (shadow casting / cover).
+    """
+    visibility = {}
+    max_r = max(DBB_FRONT_RADIUS, DBB_BACK_RADIUS)
+    fov_half = math.radians(DBB_FOV_DEG / 2)
+    rows = len(walls)
+    cols = len(walls[0]) if rows else 0
+
+    # Always see your own cell.
+    if 0 <= pr < rows and 0 <= pc < cols:
+        visibility[(pr, pc)] = 255
+
+    for dr in range(-max_r, max_r + 1):
+        for dc in range(-max_r, max_r + 1):
+            if dr == 0 and dc == 0:
+                continue
+            cr, cc = pr + dr, pc + dc
+            if cr < 0 or cr >= rows or cc < 0 or cc >= cols:
+                continue
+            dist = math.hypot(dr, dc)
+            cell_angle = math.atan2(dr, dc)
+            ad = _angle_diff(cell_angle, facing_angle)
+
+            if abs(ad) <= fov_half:
+                if dist > DBB_FRONT_RADIUS:
+                    continue
+                radial  = 1.0 - dist / DBB_FRONT_RADIUS
+                angular = 1.0 - abs(ad) / fov_half
+                # Strong center, soft edges. Never fully transparent so the
+                # cone is always readable.
+                alpha = int(90 + 165 * radial * (0.5 + 0.5 * angular))
+            else:
+                if dist > DBB_BACK_RADIUS:
+                    continue
+                radial = 1.0 - dist / DBB_BACK_RADIUS
+                alpha  = int(35 + 90 * radial)
+
+            if not line_of_sight(walls, pr, pc, cr, cc):
+                continue
+            visibility[(cr, cc)] = alpha
+    return visibility
+
+
 def is_wall(walls, r, c, gates=None):
-    """Return True if (r,c) is a wall.  Open gates are treated as passable."""
-    if r < 0 or r >= ROWS or c < 0 or c >= COLS:
+    """Return True if (r,c) is a wall.  Open gates are treated as passable.
+    Bounds are derived from `walls` so this helper works for any map size."""
+    rows = len(walls)
+    cols = len(walls[0]) if rows else 0
+    if r < 0 or r >= rows or c < 0 or c >= cols:
         return True
     if walls[r][c]:
         if gates:
@@ -135,6 +262,8 @@ def is_wall(walls, r, c, gates=None):
 # ── nearest free cell ─────────────────────────────────────────────────────────
 def nearest_free(walls, r, c, gates=None):
     """BFS from (r,c) to find the nearest non-wall cell."""
+    rows = len(walls)
+    cols = len(walls[0]) if rows else 0
     if not is_wall(walls, r, c, gates):
         return r, c
     visited = set()
@@ -144,7 +273,7 @@ def nearest_free(walls, r, c, gates=None):
         cr, cc = q.popleft()
         for dr, dc in ((0,1),(1,0),(0,-1),(-1,0)):
             nr, nc = cr + dr, cc + dc
-            if (nr, nc) not in visited and 0 <= nr < ROWS and 0 <= nc < COLS:
+            if (nr, nc) not in visited and 0 <= nr < rows and 0 <= nc < cols:
                 visited.add((nr, nc))
                 if not is_wall(walls, nr, nc, gates):
                     return nr, nc
@@ -154,11 +283,13 @@ def nearest_free(walls, r, c, gates=None):
 
 # ── bfs for hunter ────────────────────────────────────────────────────────────
 def bfs(walls, sr, sc, tr, tc, gates=None):
+    rows = len(walls)
+    cols = len(walls[0]) if rows else 0
     if (sr, sc) == (tr, tc):
         return []
 
-    dist = [[-1] * COLS for _ in range(ROWS)]
-    prev = [[None]  * COLS for _ in range(ROWS)]
+    dist = [[-1] * cols for _ in range(rows)]
+    prev = [[None]  * cols for _ in range(rows)]
 
     q = deque([(sr, sc)])
     dist[sr][sc] = 0
@@ -169,7 +300,7 @@ def bfs(walls, sr, sc, tr, tc, gates=None):
             break
         for dr, dc in ((0,1),(1,0),(0,-1),(-1,0)):
             nr, nc = r + dr, c + dc
-            if 0 <= nr < ROWS and 0 <= nc < COLS:
+            if 0 <= nr < rows and 0 <= nc < cols:
                 if not is_wall(walls, nr, nc, gates) and dist[nr][nc] == -1:
                     dist[nr][nc] = dist[r][c] + 1
                     prev[nr][nc] = (r, c)
@@ -188,10 +319,14 @@ def bfs(walls, sr, sc, tr, tc, gates=None):
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 def free_cell(walls, exclude=None):
+    """Pick a random free interior cell. For maze grids step by 2 (odd cells),
+    for arbitrary grids (DBB) just sample anywhere in the interior."""
+    rows = len(walls)
+    cols = len(walls[0]) if rows else 0
     exclude = set(exclude or [])
     for _ in range(1000):
-        r = random.choice(range(1, ROWS - 1, 2))
-        c = random.choice(range(1, COLS - 1, 2))
+        r = random.randint(1, rows - 2)
+        c = random.randint(1, cols - 2)
         if not walls[r][c] and (r, c) not in exclude:
             return r, c
     return None
@@ -508,10 +643,10 @@ class Game:
         self.lobby_rects   = []
 
         # mode picker (host only, between lobby and wait_host)
-        self.mode_options = ["ESCAPE MODE", "DEAD BY DAYLIGHT", "BACK"]
+        self.mode_options = ["ESCAPE MODE", "DBD-MAZE", "DBB", "BACK"]
         self.mode_index   = 0
         self.mode_rects   = []
-        self.mp_mode      = "escape"   # "escape" or "dbd"
+        self.mp_mode      = "escape"   # "escape" | "dbd" (DBD-MAZE) | "dbb" (DBB open map)
 
         # ESCAPE-mode settings (host-decided in lobby_wait_host)
         self.mp_settings = {"portals": True, "maze_shift": True, "hunter": "bot"}
@@ -541,6 +676,15 @@ class Game:
         self.mp_warehouses   = []     # list of Warehouse
         self.mp_match_timer  = 0.0    # countdown seconds remaining in DBD match
         self.exit_unlocked   = True   # escape: always True; DBD: False until all gens done
+
+        # DBB-specific local state (camera + facing). Facing is the angle the
+        # local player is looking at (used for the 120 deg FOV cone). It updates
+        # whenever the local player presses a movement key.
+        self.dbb_facing_angle = math.pi / 2   # default: facing down (+row)
+        self.dbb_cached_fov   = {}            # last computed visibility dict
+        self.dbb_fov_pr       = None          # cell where the FOV was computed
+        self.dbb_fov_pc       = None
+        self.dbb_fov_facing   = None
 
         self.state = "menu"
         self.reset()
@@ -826,8 +970,11 @@ class Game:
         if choice == "ESCAPE MODE":
             self.mp_mode = "escape"
             self.start_host_mode()
-        elif choice == "DEAD BY DAYLIGHT":
+        elif choice == "DBD-MAZE":
             self.mp_mode = "dbd"
+            self.start_host_mode()
+        elif choice == "DBB":
+            self.mp_mode = "dbb"
             self.start_host_mode()
         elif choice == "BACK":
             self.state = "lobby"
@@ -849,8 +996,10 @@ class Game:
         descriptions = {
             "ESCAPE MODE":
                 "Co-op: all players race to escape the maze. Bot hunter.",
-            "DEAD BY DAYLIGHT":
-                "Host plays the HUNTER. Runners repair 5 generators to unlock the exit.",
+            "DBD-MAZE":
+                "Hunter vs runners on a maze. Runners repair generators to unlock the exit.",
+            "DBB":
+                "Hunter vs runners on a huge open map. 120 deg FOV, line-of-sight, hide behind cover.",
             "BACK":
                 "Return to the lobby.",
         }
@@ -992,7 +1141,11 @@ class Game:
             title = self.font_xl.render("HOSTING", True, CYAN)
             self.surf.blit(title, (W // 2 - title.get_width() // 2, 60))
 
-            mode_label = "ESCAPE MODE" if self.mp_mode == "escape" else "DEAD BY DAYLIGHT"
+            mode_label = {
+                "escape": "ESCAPE MODE",
+                "dbd":    "DBD-MAZE",
+                "dbb":    "DBB",
+            }.get(self.mp_mode, self.mp_mode.upper())
             mode_text = self.font_med.render(f"Mode: {mode_label}",
                                              True, (255, 220, 80))
             self.surf.blit(mode_text,
@@ -1189,7 +1342,7 @@ class Game:
                     "carried": False, "carry_timer": 0.0,
                     "carrying_pid": None, "catch_cooldown": 0.0,
                 })
-        else:  # dbd
+        elif self.mp_mode == "dbd":
             self.exit_unlocked = False
             # randomly pick which slot is the hunter
             hunter_idx = random.randrange(slots)
@@ -1228,6 +1381,59 @@ class Game:
             # DBD: no portals (rebuild without them) and disable hunter bot via mode flag
             self.portals = []
 
+        else:  # dbb — huge open map with FOV-limited vision
+            self.exit_unlocked = False
+            # Replace the maze with a large open arena. Gates and portals don't
+            # make sense on an open map, so clear them.
+            self.walls   = build_dbb_map(DBB_ROWS, DBB_COLS)
+            self.gates   = []
+            self.portals = []
+            self.exit_pos = nearest_free(
+                self.walls, DBB_ROWS - 4, DBB_COLS - 4, self.gates)
+
+            # Spawns: runners cluster in one corner; hunter at the centre so
+            # the early game is a real hunt rather than a guaranteed travel time.
+            dbb_runner_spawns = [(4, 4), (4, 6), (6, 4), (6, 6)]
+            hunter_spawn = nearest_free(
+                self.walls, DBB_ROWS // 2, DBB_COLS // 2, self.gates)
+            hunter_idx = random.randrange(slots)
+            runner_seen = 0
+            for i in range(slots):
+                if i == hunter_idx:
+                    r, c, role = hunter_spawn[0], hunter_spawn[1], "hunter"
+                else:
+                    sr, sc = dbb_runner_spawns[runner_seen] \
+                             if runner_seen < len(dbb_runner_spawns) else (4, 4)
+                    r, c = nearest_free(self.walls, sr, sc, self.gates)
+                    role = "runner"
+                    runner_seen += 1
+                self.mp_players.append({
+                    "id": i, "r": r, "c": c, "alive": True,
+                    "role": role,
+                    "imprisoned": False, "imprison_remaining": 0.0,
+                    "carried": False, "carry_timer": 0.0,
+                    "carrying_pid": None, "catch_cooldown": 0.0,
+                })
+
+            # Generators / warehouses scattered around the arena.
+            taken = [(p["r"], p["c"]) for p in self.mp_players]
+            for _ in range(DBD_GEN_COUNT):
+                cell = free_cell(self.walls, taken)
+                if cell is None: break
+                taken.append(cell)
+                self.mp_generators.append(Generator(cell[0], cell[1]))
+            for _ in range(DBD_WAREHOUSE_COUNT):
+                cell = free_cell(self.walls, taken)
+                if cell is None: break
+                taken.append(cell)
+                self.mp_warehouses.append(Warehouse(cell[0], cell[1]))
+
+            # Reset local FOV cache so the first frame computes fresh.
+            self.dbb_cached_fov = {}
+            self.dbb_fov_pr = None
+            self.dbb_fov_pc = None
+            self.dbb_fov_facing = None
+
         self.mp_move_timers = [0.0] * network.MAX_PLAYERS
 
         # broadcast maze then start (include mode + DBD entities)
@@ -1238,11 +1444,13 @@ class Game:
     def _serialize_maze(self):
         """Compact maze description sent on level start / maze shift."""
         wall_rows = ["".join("1" if w else "0" for w in row) for row in self.walls]
+        rows = len(self.walls)
+        cols = len(self.walls[0]) if rows else 0
         return {
             "type":    "maze",
             "mode":    self.mp_mode,
-            "rows":    ROWS,
-            "cols":    COLS,
+            "rows":    rows,
+            "cols":    cols,
             "walls":   wall_rows,
             "exit":    list(self.exit_pos),
             "gates":   [[g.r, g.c] for g in self.gates],
@@ -1360,8 +1568,9 @@ class Game:
                                 self.level += 1
                                 self.host_advance_level()
                                 return
-                        elif self.mp_mode == "dbd" and p["role"] == "runner" \
+                        elif self.mp_mode in ("dbd", "dbb") and p["role"] == "runner" \
                              and self.exit_unlocked:
+                            # Runner reached the exit after all gens were repaired.
                             self.mp_winner = "runners"
                             self.state = "mp_end"
                             self.server.broadcast({"type": "end", "winner": "runners"})
@@ -1420,7 +1629,7 @@ class Game:
                     self.maze_timer = 0.0
                     self.host_shift_maze()
 
-        else:  # DBD mode
+        else:  # DBD-MAZE or DBB — both share the hunter/gens/warehouses logic
             self._dbd_tick(dt)
             if self.state == "mp_end":
                 return
@@ -1660,6 +1869,11 @@ class Game:
 
     # ── multiplayer render ────────────────────────────────────────────────────
     def draw_mp_play(self):
+        # DBB has its own render path (camera + FOV cone) — totally different
+        # from the maze-locked layout used by ESCAPE / DBD-MAZE.
+        if self.mp_mode == "dbb":
+            return self._draw_dbb_play()
+
         self.draw_maze()
 
         for g in self.gates:
@@ -1735,11 +1949,203 @@ class Game:
 
         self.draw_mp_panel()
 
+    # ── DBB render (camera + FOV cone) ───────────────────────────────────────
+    def _draw_dbb_play(self):
+        """Render the DBB open map from the local player's perspective.
+
+        Layout:
+          - Camera centers the local player in the play area (left of panel).
+          - The 120 deg cone in front + a small halo behind defines visibility.
+          - Walls cast shadows: any cell whose ray from the player crosses a
+            wall is hidden, so players hiding behind cover are invisible.
+        """
+        play_w = PANEL_X
+        play_h = H
+
+        me = next((p for p in self.mp_players if p["id"] == self.player_id), None)
+        if me is None:
+            self.surf.fill(BLACK)
+            self.draw_mp_panel()
+            return
+
+        # If the local player is dead/imprisoned/carried we still want to show
+        # the world from their last position — facing freezes too.
+        pr, pc = me["r"], me["c"]
+        facing = self.dbb_facing_angle
+
+        # camera (in pixels): place the player at the centre of the play area
+        cam_x = pc * DBB_CELL + DBB_CELL // 2 - play_w // 2
+        cam_y = pr * DBB_CELL + DBB_CELL // 2 - play_h // 2
+
+        def to_screen(r, c):
+            return (c * DBB_CELL + DBB_CELL // 2 - cam_x,
+                    r * DBB_CELL + DBB_CELL // 2 - cam_y)
+
+        # Recompute FOV only when position or facing changed (the calc is
+        # quadratic in radius — cheap, but skipping it on still frames is free).
+        if (pr, pc, facing) != (self.dbb_fov_pr, self.dbb_fov_pc, self.dbb_fov_facing):
+            self.dbb_cached_fov = compute_dbb_fov(self.walls, pr, pc, facing)
+            self.dbb_fov_pr     = pr
+            self.dbb_fov_pc     = pc
+            self.dbb_fov_facing = facing
+        visibility = self.dbb_cached_fov
+
+        # 1. dark background everywhere (anything we don't draw stays pitch black)
+        self.surf.fill(BLACK)
+
+        # 2. floor + walls — only inside the visibility set
+        rows = len(self.walls)
+        cols = len(self.walls[0]) if rows else 0
+        for (r, c), _alpha in visibility.items():
+            if not (0 <= r < rows and 0 <= c < cols):
+                continue
+            x, y = to_screen(r, c)
+            rect = pygame.Rect(x - DBB_CELL // 2, y - DBB_CELL // 2,
+                               DBB_CELL, DBB_CELL)
+            if self.walls[r][c]:
+                pygame.draw.rect(self.surf, (0, 40, 70),  rect)
+                pygame.draw.rect(self.surf, (0, 90, 140), rect, 1)
+            else:
+                pygame.draw.rect(self.surf, (8, 16, 28), rect)
+
+        # 3. generators (use Generator.draw, which uses cell_xy — for DBB we
+        #    bypass that and draw inline so we can use the camera transform)
+        for gen in self.mp_generators:
+            if (gen.r, gen.c) not in visibility:
+                continue
+            self._draw_dbb_generator(gen, to_screen)
+
+        # 4. warehouses
+        for w in self.mp_warehouses:
+            if (w.r, w.c) not in visibility:
+                continue
+            self._draw_dbb_warehouse(w, to_screen)
+
+        # 5. exit (always draw if cell is visible)
+        if self.exit_pos in visibility:
+            ex, ey = to_screen(*self.exit_pos)
+            size = int(DBB_CELL * 0.35)
+            points = [(ex, ey - size), (ex + size, ey),
+                      (ex, ey + size), (ex - size, ey)]
+            pygame.draw.polygon(self.surf, WHITE, points)
+            if not self.exit_unlocked:
+                pygame.draw.line(self.surf, (255, 80, 80),
+                                 (ex - DBB_CELL // 3, ey - DBB_CELL // 3),
+                                 (ex + DBB_CELL // 3, ey + DBB_CELL // 3), 3)
+                pygame.draw.line(self.surf, (255, 80, 80),
+                                 (ex - DBB_CELL // 3, ey + DBB_CELL // 3),
+                                 (ex + DBB_CELL // 3, ey - DBB_CELL // 3), 3)
+
+        # 6. players. Only those whose cell is in visibility are drawn — that's
+        #    the "hide behind cover" mechanic. Local player is always shown.
+        for p in self.mp_players:
+            if not p["alive"]:
+                continue
+            is_me = (p["id"] == self.player_id)
+            if not is_me and (p["r"], p["c"]) not in visibility:
+                continue
+            if p.get("role") == "hunter":
+                color = (255, 60, 60)
+            else:
+                color = PLAYER_COLORS[p["id"] % len(PLAYER_COLORS)]
+            x, y   = to_screen(p["r"], p["c"])
+            radius = int(DBB_CELL * 0.30)
+
+            if p.get("imprisoned") or p.get("carried"):
+                pygame.draw.circle(self.surf, color, (x, y), radius // 2)
+                arc_color = (255, 80, 80) if p.get("imprisoned") else (255, 220, 0)
+                pygame.draw.circle(self.surf, arc_color, (x, y), radius, 2)
+                if p.get("imprisoned"):
+                    frac = max(0.0, p.get("imprison_remaining", 0)) / WAREHOUSE_IMPRISON
+                else:
+                    frac = max(0.0, p.get("carry_timer", 0)) / HUNTER_CARRY_TIME
+                arc_rect = pygame.Rect(x - radius - 4, y - radius - 4,
+                                       (radius + 4) * 2, (radius + 4) * 2)
+                pygame.draw.arc(self.surf, arc_color, arc_rect,
+                                -math.pi / 2,
+                                -math.pi / 2 + math.tau * frac, 3)
+            else:
+                pygame.draw.circle(self.surf, color, (x, y), radius)
+
+            if is_me:
+                pygame.draw.circle(self.surf, WHITE, (x, y), radius + 2, 2)
+                # facing indicator: a short line pointing where the FOV cone is
+                tip_x = x + int(math.cos(facing) * DBB_CELL * 0.7)
+                tip_y = y + int(math.sin(facing) * DBB_CELL * 0.7)
+                pygame.draw.line(self.surf, WHITE, (x, y), (tip_x, tip_y), 2)
+
+        # 7. fog overlay: pure black outside visibility, fading to clear at the
+        #    centre of the cone. Drawn over only the play area (left of panel).
+        fog = pygame.Surface((play_w, play_h), pygame.SRCALPHA)
+        fog.fill((0, 0, 0, 255))
+        for (r, c), alpha in visibility.items():
+            x, y = to_screen(r, c)
+            if x + DBB_CELL // 2 < 0 or x - DBB_CELL // 2 > play_w:
+                continue
+            if y + DBB_CELL // 2 < 0 or y - DBB_CELL // 2 > play_h:
+                continue
+            inv = max(0, 255 - alpha)
+            rect = pygame.Rect(x - DBB_CELL // 2, y - DBB_CELL // 2,
+                               DBB_CELL, DBB_CELL)
+            pygame.draw.rect(fog, (0, 0, 0, inv), rect)
+        self.surf.blit(fog, (0, 0))
+
+        # 8. panel (always fully lit)
+        self.draw_mp_panel()
+
+    def _draw_dbb_generator(self, gen, to_screen):
+        """Generator render that uses the DBB camera transform."""
+        x, y = to_screen(gen.r, gen.c)
+        size = int(DBB_CELL * 0.75)
+        rect = pygame.Rect(x - size // 2, y - size // 2, size, size)
+
+        if gen.completed:
+            pygame.draw.rect(self.surf, (80, 255, 80), rect, border_radius=4)
+            pygame.draw.rect(self.surf, WHITE,          rect, 2, border_radius=4)
+            return
+
+        pygame.draw.rect(self.surf, (40, 80, 140), rect, border_radius=4)
+        if gen.progress > 0:
+            frac = gen.progress / GEN_REPAIR_TIME
+            fill_h = max(2, int(size * frac))
+            fill_rect = pygame.Rect(rect.x, rect.bottom - fill_h, size, fill_h)
+            pygame.draw.rect(self.surf, (255, 220, 0), fill_rect, border_radius=4)
+        pygame.draw.rect(self.surf, (120, 180, 255), rect, 2, border_radius=4)
+
+        if gen.progress > 0:
+            frac = gen.progress / GEN_REPAIR_TIME
+            bar_w = DBB_CELL - 6
+            bar_h = max(6, DBB_CELL // 8)
+            bx = x - bar_w // 2
+            by = y - DBB_CELL // 2 - bar_h - 4
+            pygame.draw.rect(self.surf, (30, 30, 30), (bx, by, bar_w, bar_h),
+                             border_radius=2)
+            pygame.draw.rect(self.surf, (255, 220, 0),
+                             (bx, by, int(bar_w * frac), bar_h),
+                             border_radius=2)
+            pygame.draw.rect(self.surf, WHITE, (bx, by, bar_w, bar_h),
+                             1, border_radius=2)
+
+    def _draw_dbb_warehouse(self, w, to_screen):
+        x, y = to_screen(w.r, w.c)
+        size = int(DBB_CELL * 0.8)
+        rect = pygame.Rect(x - size // 2, y - size // 2, size, size)
+        pygame.draw.rect(self.surf, (60, 60, 70),    rect, border_radius=4)
+        pygame.draw.rect(self.surf, (140, 140, 160), rect, 2, border_radius=4)
+        for i in range(3):
+            bx = rect.x + 6 + i * (size // 3)
+            pygame.draw.line(self.surf, (180, 180, 200),
+                             (bx, rect.y + 4), (bx, rect.bottom - 4), 1)
+
     def draw_mp_panel(self):
         pygame.draw.rect(self.surf, PANEL_BG, (PANEL_X, 0, PANEL_W, H))
         pygame.draw.line(self.surf, (0, 120, 200), (PANEL_X, 0), (PANEL_X, H), 3)
 
-        mode_label = "ESCAPE" if self.mp_mode == "escape" else "DBD"
+        mode_label = {
+            "escape": "ESCAPE",
+            "dbd":    "DBD-MAZE",
+            "dbb":    "DBB",
+        }.get(self.mp_mode, self.mp_mode.upper())
         role = "HOST" if self.server is not None else "CLIENT"
         title = self.font_lg.render(mode_label, True, CYAN)
         self.surf.blit(title, (PANEL_X + PANEL_W // 2 - title.get_width() // 2, 18))
@@ -1798,6 +2204,13 @@ class Game:
             hints = [
                 "WASD / ARROWS : MOVE",
                 "HOLD E : open gate",
+                "ESC : leave match",
+            ]
+        elif self.mp_mode == "dbb":
+            hints = [
+                "WASD / ARROWS : MOVE & TURN",
+                "HOLD E : repair / rescue",
+                "120 deg FOV - hide behind cover",
                 "ESC : leave match",
             ]
         else:
@@ -2095,6 +2508,14 @@ class Game:
                 self.mp_local_input = {
                     "dr": dr, "dc": dc, "e_held": pressed[pygame.K_e],
                 }
+
+                # In DBB the local player has a directional 120 deg FOV cone.
+                # Facing follows the last movement key pressed; this gives the
+                # player explicit control of where they're looking (turning in
+                # place by tapping a direction key works because we update on
+                # the key press, not on the actual grid move).
+                if self.mp_mode == "dbb" and (dr or dc):
+                    self.dbb_facing_angle = math.atan2(dr, dc)
 
                 if self.server is not None:
                     self.mp_host_tick(dt)
