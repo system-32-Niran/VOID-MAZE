@@ -15,6 +15,7 @@ import sys
 from collections import deque
 
 import network
+from maps.map_dbd import build_dbd_facility
 
 # Place the borderless window at the top-left of the primary display.
 # Must be set BEFORE pygame.init() / display.set_mode for SDL to pick it up.
@@ -431,10 +432,10 @@ class Gate:
 
 # ── DBD entities ──────────────────────────────────────────────────────────────
 GEN_REPAIR_TIME    = 10.0   # seconds of held E to finish a generator
-WAREHOUSE_IMPRISON = 30.0   # seconds before an imprisoned runner is eliminated
+FREEZING_POD_IMPRISON = 30.0   # seconds before an imprisoned runner is eliminated
 DBD_MATCH_LENGTH   = 7 * 60 # 7 minutes
 DBD_GEN_COUNT      = 4
-DBD_WAREHOUSE_COUNT = 3
+DBD_FREEZING_POD_COUNT = 5
 HUNTER_CARRY_TIME   = 10.0   # seconds the hunter can carry a runner before they escape
 
 
@@ -488,8 +489,8 @@ class Generator:
                              1, border_radius=2)
 
 
-class Warehouse:
-    """A holding cell. When the hunter brings a runner here they're imprisoned."""
+class FreezingPod:
+    """A cryo-containment cell. When the hunter brings a runner here they're imprisoned."""
 
     def __init__(self, r, c):
         self.r = r
@@ -503,13 +504,16 @@ class Warehouse:
         x, y = cell_xy(self.r, self.c)
         size = int(CELL * 0.8)
         rect = pygame.Rect(x - size // 2, y - size // 2, size, size)
-        pygame.draw.rect(surf, (60, 60, 70), rect, border_radius=4)
-        pygame.draw.rect(surf, (140, 140, 160), rect, 2, border_radius=4)
-        # prison-bar pattern
+        # Icy blue cryo-pod
+        pygame.draw.rect(surf, (20, 40, 80), rect, border_radius=6)
+        pygame.draw.rect(surf, (80, 180, 220), rect, 2, border_radius=6)
+        # Frost lines (horizontal glass bands)
         for i in range(3):
-            bx = rect.x + 6 + i * (size // 3)
-            pygame.draw.line(surf, (180, 180, 200),
-                             (bx, rect.y + 4), (bx, rect.bottom - 4), 1)
+            fy = rect.y + 5 + i * (size // 3)
+            pygame.draw.line(surf, (100, 200, 240),
+                             (rect.x + 4, fy), (rect.right - 4, fy), 1)
+        # Centre glint
+        pygame.draw.circle(surf, (150, 230, 255), (x, y), max(2, size // 8))
 
 
 # ── portal ─────────────────────────────────────────────────────────────────────
@@ -673,7 +677,7 @@ class Game:
 
         # DBD-specific shared state
         self.mp_generators   = []     # list of Generator
-        self.mp_warehouses   = []     # list of Warehouse
+        self.mp_freezing_pods   = []     # list of FreezingPod
         self.mp_match_timer  = 0.0    # countdown seconds remaining in DBD match
         self.exit_unlocked   = True   # escape: always True; DBD: False until all gens done
 
@@ -1284,7 +1288,7 @@ class Game:
         self.mp_players      = []
         self.mp_pending_input = {}
         self.mp_generators   = []
-        self.mp_warehouses   = []
+        self.mp_freezing_pods   = []
         self.mp_winner       = ""
         self.exit_unlocked   = True
         self.player_id        = 0
@@ -1298,7 +1302,7 @@ class Game:
 
         self.new_level()
         self.mp_generators = []
-        self.mp_warehouses = []
+        self.mp_freezing_pods = []
         self.mp_winner     = ""
         self.mp_match_timer = DBD_MATCH_LENGTH
 
@@ -1366,44 +1370,43 @@ class Game:
                     "carried": False, "carry_timer": 0.0,
                     "carrying_pid": None, "catch_cooldown": 0.0,
                 })
-            # place generators + warehouses on free cells
+            # place generators + freezing pods on free cells
             taken = [(p["r"], p["c"]) for p in self.mp_players]
             for _ in range(DBD_GEN_COUNT):
                 cell = free_cell(self.walls, taken)
                 if cell is None: break
                 taken.append(cell)
                 self.mp_generators.append(Generator(cell[0], cell[1]))
-            for _ in range(DBD_WAREHOUSE_COUNT):
+            for _ in range(DBD_FREEZING_POD_COUNT):
                 cell = free_cell(self.walls, taken)
                 if cell is None: break
                 taken.append(cell)
-                self.mp_warehouses.append(Warehouse(cell[0], cell[1]))
-            # DBD: no portals (rebuild without them) and disable hunter bot via mode flag
+                self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
+            # DBD-MAZE: no portals
             self.portals = []
 
-        else:  # dbb — huge open map with FOV-limited vision
+        else:  # dbb — hand-crafted DBD facility map with FOV-limited vision
             self.exit_unlocked = False
-            # Replace the maze with a large open arena. Gates and portals don't
-            # make sense on an open map, so clear them.
-            self.walls   = build_dbb_map(DBB_ROWS, DBB_COLS)
+            # Load the hand-crafted facility map (replaces the large open arena)
+            (self.walls, gen_positions, pod_positions,
+             dbb_runner_spawns, dbb_hunter_spawn,
+             dbb_exit_pos) = build_dbd_facility()
+            self.exit_pos = dbb_exit_pos
             self.gates   = []
+            self.build_gates()   # auto-pick doorway wall cells as openable gates
             self.portals = []
-            self.exit_pos = nearest_free(
-                self.walls, DBB_ROWS - 4, DBB_COLS - 4, self.gates)
 
-            # Spawns: runners cluster in one corner; hunter at the centre so
-            # the early game is a real hunt rather than a guaranteed travel time.
-            dbb_runner_spawns = [(4, 4), (4, 6), (6, 4), (6, 6)]
-            hunter_spawn = nearest_free(
-                self.walls, DBB_ROWS // 2, DBB_COLS // 2, self.gates)
+            # Spawns: runners start in the Spawn Area; hunter at facility centre
             hunter_idx = random.randrange(slots)
+            hunter_r, hunter_c = nearest_free(
+                self.walls, *dbb_hunter_spawn, self.gates)
             runner_seen = 0
             for i in range(slots):
                 if i == hunter_idx:
-                    r, c, role = hunter_spawn[0], hunter_spawn[1], "hunter"
+                    r, c, role = hunter_r, hunter_c, "hunter"
                 else:
-                    sr, sc = dbb_runner_spawns[runner_seen] \
-                             if runner_seen < len(dbb_runner_spawns) else (4, 4)
+                    sr, sc = dbb_runner_spawns[
+                        runner_seen % len(dbb_runner_spawns)]
                     r, c = nearest_free(self.walls, sr, sc, self.gates)
                     role = "runner"
                     runner_seen += 1
@@ -1415,18 +1418,13 @@ class Game:
                     "carrying_pid": None, "catch_cooldown": 0.0,
                 })
 
-            # Generators / warehouses scattered around the arena.
-            taken = [(p["r"], p["c"]) for p in self.mp_players]
-            for _ in range(DBD_GEN_COUNT):
-                cell = free_cell(self.walls, taken)
-                if cell is None: break
-                taken.append(cell)
-                self.mp_generators.append(Generator(cell[0], cell[1]))
-            for _ in range(DBD_WAREHOUSE_COUNT):
-                cell = free_cell(self.walls, taken)
-                if cell is None: break
-                taken.append(cell)
-                self.mp_warehouses.append(Warehouse(cell[0], cell[1]))
+            # Place generators + freezing pods at fixed facility positions
+            for gr, gc in gen_positions[:DBD_GEN_COUNT]:
+                r, c = nearest_free(self.walls, gr, gc, self.gates)
+                self.mp_generators.append(Generator(r, c))
+            for pr, pc in pod_positions[:DBD_FREEZING_POD_COUNT]:
+                r, c = nearest_free(self.walls, pr, pc, self.gates)
+                self.mp_freezing_pods.append(FreezingPod(r, c))
 
             # Reset local FOV cache so the first frame computes fresh.
             self.dbb_cached_fov = {}
@@ -1456,7 +1454,7 @@ class Game:
             "gates":   [[g.r, g.c] for g in self.gates],
             "portals": [[p.r, p.c, p.pair_idx, list(p.color)] for p in self.portals],
             "generators": [[g.r, g.c] for g in self.mp_generators],
-            "warehouses": [[w.r, w.c] for w in self.mp_warehouses],
+            "freezing_pods": [[w.r, w.c] for w in self.mp_freezing_pods],
         }
 
     def _apply_maze(self, msg):
@@ -1468,7 +1466,7 @@ class Game:
         self.portals = [Portal(r, c, pi, tuple(co))
                         for r, c, pi, co in msg["portals"]]
         self.mp_generators = [Generator(r, c) for r, c in msg.get("generators", [])]
-        self.mp_warehouses = [Warehouse(r, c) for r, c in msg.get("warehouses", [])]
+        self.mp_freezing_pods = [FreezingPod(r, c) for r, c in msg.get("freezing_pods", [])]
 
     def _serialize_state(self):
         hunter_pos = None
@@ -1481,7 +1479,7 @@ class Game:
             "gates":   [g.is_open for g in self.gates],
             "level":   self.level,
             "gens":    [[g.progress, g.completed] for g in self.mp_generators],
-            "wh":      [w.imprisoned_pid for w in self.mp_warehouses],
+            "fp":      [w.imprisoned_pid for w in self.mp_freezing_pods],
             "timer":   self.mp_match_timer,
             "exit_unlocked": self.exit_unlocked,
         }
@@ -1505,8 +1503,8 @@ class Game:
         for i, g in enumerate(self.mp_generators):
             if i < len(gens):
                 g.progress, g.completed = gens[i]
-        wh = msg.get("wh", [])
-        for i, w in enumerate(self.mp_warehouses):
+        wh = msg.get("fp", [])
+        for i, w in enumerate(self.mp_freezing_pods):
             if i < len(wh):
                 w.imprisoned_pid = wh[i]
         self.mp_match_timer = msg.get("timer", self.mp_match_timer)
@@ -1698,7 +1696,7 @@ class Game:
                     carried_runner["c"] = hunter["c"]
 
                     put_in_wh = None
-                    for w in self.mp_warehouses:
+                    for w in self.mp_freezing_pods:
                         if w.imprisoned_pid is None and w.is_adjacent(hunter["r"], hunter["c"]):
                             put_in_wh = w
                             break
@@ -1720,7 +1718,7 @@ class Game:
                     hunter["carrying_pid"] = None
 
         # rescue: any free runner adjacent to a warehouse holding an imprisoned one
-        for w in self.mp_warehouses:
+        for w in self.mp_freezing_pods:
             if w.imprisoned_pid is None:
                 continue
             for p in self.mp_players:
@@ -1740,7 +1738,7 @@ class Game:
                     # timer ran out → eliminated
                     p["alive"] = False
                     p["imprisoned"] = False
-                    for w in self.mp_warehouses:
+                    for w in self.mp_freezing_pods:
                         if w.imprisoned_pid == p["id"]:
                             w.imprisoned_pid = None
 
@@ -1753,12 +1751,12 @@ class Game:
     def _imprison_runner_in(self, runner, w):
         runner["r"], runner["c"] = w.r, w.c
         runner["imprisoned"] = True
-        runner["imprison_remaining"] = WAREHOUSE_IMPRISON
+        runner["imprison_remaining"] = FREEZING_POD_IMPRISON
         w.imprisoned_pid = runner["id"]
 
     def _imprison_runner(self, runner):
         # find a warehouse without an imprisoned player
-        free_wh = [w for w in self.mp_warehouses if w.imprisoned_pid is None]
+        free_wh = [w for w in self.mp_freezing_pods if w.imprisoned_pid is None]
         if not free_wh:
             # all warehouses occupied — just kill them (edge case)
             runner["alive"] = False
@@ -1766,7 +1764,7 @@ class Game:
         w = random.choice(free_wh)
         runner["r"], runner["c"] = w.r, w.c
         runner["imprisoned"] = True
-        runner["imprison_remaining"] = WAREHOUSE_IMPRISON
+        runner["imprison_remaining"] = FREEZING_POD_IMPRISON
         w.imprisoned_pid = runner["id"]
 
     def _free_runner(self, w):
@@ -1882,7 +1880,7 @@ class Game:
         # DBD entities
         for gen in self.mp_generators:
             gen.draw(self.surf)
-        for w in self.mp_warehouses:
+        for w in self.mp_freezing_pods:
             w.draw(self.surf)
 
         # portals (escape mode only)
@@ -1919,7 +1917,7 @@ class Game:
                 pygame.draw.circle(self.surf, color, (x, y), radius // 2)
                 if p.get("imprisoned"):
                     pygame.draw.circle(self.surf, (200, 200, 200), (x, y), radius, 2)
-                    frac = max(0.0, p.get("imprison_remaining", 0)) / WAREHOUSE_IMPRISON
+                    frac = max(0.0, p.get("imprison_remaining", 0)) / FREEZING_POD_IMPRISON
                     arc_color = (255, 80, 80)
                 else:
                     pygame.draw.circle(self.surf, (255, 220, 0), (x, y), radius, 2)
@@ -2016,10 +2014,10 @@ class Game:
             self._draw_dbb_generator(gen, to_screen)
 
         # 4. warehouses
-        for w in self.mp_warehouses:
+        for w in self.mp_freezing_pods:
             if (w.r, w.c) not in visibility:
                 continue
-            self._draw_dbb_warehouse(w, to_screen)
+            self._draw_dbb_freezing_pod(w, to_screen)
 
         # 5. exit (always draw if cell is visible)
         if self.exit_pos in visibility:
@@ -2056,7 +2054,7 @@ class Game:
                 arc_color = (255, 80, 80) if p.get("imprisoned") else (255, 220, 0)
                 pygame.draw.circle(self.surf, arc_color, (x, y), radius, 2)
                 if p.get("imprisoned"):
-                    frac = max(0.0, p.get("imprison_remaining", 0)) / WAREHOUSE_IMPRISON
+                    frac = max(0.0, p.get("imprison_remaining", 0)) / FREEZING_POD_IMPRISON
                 else:
                     frac = max(0.0, p.get("carry_timer", 0)) / HUNTER_CARRY_TIME
                 arc_rect = pygame.Rect(x - radius - 4, y - radius - 4,
@@ -2126,16 +2124,17 @@ class Game:
             pygame.draw.rect(self.surf, WHITE, (bx, by, bar_w, bar_h),
                              1, border_radius=2)
 
-    def _draw_dbb_warehouse(self, w, to_screen):
+    def _draw_dbb_freezing_pod(self, w, to_screen):
         x, y = to_screen(w.r, w.c)
         size = int(DBB_CELL * 0.8)
         rect = pygame.Rect(x - size // 2, y - size // 2, size, size)
-        pygame.draw.rect(self.surf, (60, 60, 70),    rect, border_radius=4)
-        pygame.draw.rect(self.surf, (140, 140, 160), rect, 2, border_radius=4)
+        pygame.draw.rect(self.surf, (20, 40, 80),   rect, border_radius=6)
+        pygame.draw.rect(self.surf, (80, 180, 220), rect, 2, border_radius=6)
         for i in range(3):
-            bx = rect.x + 6 + i * (size // 3)
-            pygame.draw.line(self.surf, (180, 180, 200),
-                             (bx, rect.y + 4), (bx, rect.bottom - 4), 1)
+            fy = rect.y + 5 + i * (size // 3)
+            pygame.draw.line(self.surf, (100, 200, 240),
+                             (rect.x + 4, fy), (rect.right - 4, fy), 1)
+        pygame.draw.circle(self.surf, (150, 230, 255), (x, y), max(2, size // 8))
 
     def draw_mp_panel(self):
         pygame.draw.rect(self.surf, PANEL_BG, (PANEL_X, 0, PANEL_W, H))
