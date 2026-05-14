@@ -1,10 +1,5 @@
 """
-fix bug other player cannot open gate and sync movement between host and client
-Nguyên nhân gốc rễ (Bug logic mạng): Game của bạn chạy ở tốc độ 60 FPS (60 khung hình/giây), nhưng máy khách (client/người chơi khác) chỉ gửi tín hiệu phím bấm lên host 30 lần/giây qua mạng. Trước đây, sau mỗi khung hình, host lại tiến hành xoá sạch bộ nhớ phím bấm (self.mp_pending_input = {}). Điều này dẫn đến việc phím bấm của người chơi khác bị rớt nhịp (cứ 1 khung hình có phím thì khung tiếp theo lại bị coi là nhả phím).
 
-Host đẩy tín hiệu cục bộ của chính mình lên mỗi khung hình nên không bị ảnh hưởng.
-Người chơi khác bị coi là "nhấp nhả" liên tục nên tốc độ sửa máy, mở cổng (Gate) và di chuyển bị chậm đi đúng một nửa hoặc hoàn toàn bị gián đoạn. Việc mở cổng yêu cầu giữ lỳ nút E liên tục trong 0.5s, vì tín hiệu bị ngắt quãng nên người chơi khác không bao giờ có thể mở được cổng.
-Cách tôi đã sửa: Tôi bỏ đi dòng lệnh xoá bộ nhớ phím. Bây giờ trạng thái phím (e_held, dr, dc) của mỗi người chơi sẽ được giữ nguyên cho đến khi có gói tin mạng mới từ người đó gửi đến báo rằng họ đã thả phím ra.
 """
 
 import os
@@ -15,6 +10,7 @@ import sys
 from collections import deque
 
 import network
+import maps.map_dbd
 from maps.map_dbd import build_dbd_facility
 
 # Place the borderless window at the top-left of the primary display.
@@ -283,6 +279,45 @@ def nearest_free(walls, r, c, gates=None):
 
 
 # ── bfs for hunter ────────────────────────────────────────────────────────────
+
+def bfs_adjacent(walls, sr, sc, tr, tc, gates=None):
+    if abs(sr - tr) + abs(sc - tc) == 1:
+        return []
+        
+    rows = len(walls)
+    cols = len(walls[0]) if rows else 0
+    dist = [[-1] * cols for _ in range(rows)]
+    prev = [[None]  * cols for _ in range(rows)]
+
+    q = deque([(sr, sc)])
+    dist[sr][sc] = 0
+
+    target_adj = None
+    while q:
+        r, c = q.popleft()
+        if abs(r - tr) + abs(c - tc) == 1:
+            target_adj = (r, c)
+            break
+        for dr, dc in ((0,1),(1,0),(0,-1),(-1,0)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if not is_wall(walls, nr, nc, gates) and dist[nr][nc] == -1:
+                    dist[nr][nc] = dist[r][c] + 1
+                    prev[nr][nc] = (r, c)
+                    q.append((nr, nc))
+
+    if target_adj is None:
+        return None
+
+    path = []
+    curr = target_adj
+    while curr != (sr, sc):
+        path.append(curr)
+        curr = prev[curr[0]][curr[1]]
+    path.reverse()
+    return path
+
+
 def bfs(walls, sr, sc, tr, tc, gates=None):
     rows = len(walls)
     cols = len(walls[0]) if rows else 0
@@ -653,7 +688,7 @@ class Game:
         self.mp_mode      = "escape"   # "escape" | "dbd" (DBD-MAZE) | "dbb" (DBB open map)
 
         # ESCAPE-mode settings (host-decided in lobby_wait_host)
-        self.mp_settings = {"portals": True, "maze_shift": True, "hunter": "bot"}
+        self.mp_settings = {"portals": True, "maze_shift": True, "hunter": "bot", "bot_runners": 0}
         self.settings_rows  = ["PORTALS", "MAZE SHIFT", "HUNTER"]
         self.settings_index = 0
 
@@ -689,6 +724,13 @@ class Game:
         self.dbb_fov_pr       = None          # cell where the FOV was computed
         self.dbb_fov_pc       = None
         self.dbb_fov_facing   = None
+
+        # map vote state
+        self.mp_map_votes    = {}     # pid -> vote_index (0..3)
+        self.mp_vote_timer   = 0.0
+        self.mp_vote_options = ["RANDOM MAP", "THE FACILITY", "THE ASYLUM", "THE LABYRINTH"]
+        self.mp_vote_index   = 0
+        self.mp_selected_map = 0
 
         self.state = "menu"
         self.reset()
@@ -1136,6 +1178,10 @@ class Game:
             choices = ["off", "bot", "player"]
             idx = choices.index(v) if v in choices else 1
             self.mp_settings[key] = choices[(idx + direction) % len(choices)]
+        elif key == "bot_runners":
+            max_bots = max(0, network.MAX_PLAYERS - self.server.count() - 1)
+            v = max(0, min(v + direction, max_bots))
+            self.mp_settings[key] = v
 
     # ── lobby_wait (host or client waiting room) ──────────────────────────────
     def draw_lobby_wait(self):
@@ -1165,34 +1211,40 @@ class Game:
                                         True, WHITE)
             self.surf.blit(count, (W // 2 - count.get_width() // 2, 240))
 
-            # ESCAPE: host-decided settings (DBD has fixed settings)
-            if self.mp_mode == "escape":
-                head = self.font_med.render("SETTINGS", True, WHITE)
-                self.surf.blit(head, (W // 2 - head.get_width() // 2, 320))
+            # host-decided settings
+            active_rows = ["PORTALS", "MAZE SHIFT", "HUNTER"] if self.mp_mode == "escape" else ["BOT RUNNERS"]
+            self.settings_rows = active_rows
+            if self.settings_index >= len(self.settings_rows):
+                self.settings_index = 0
 
-                row_h = 50
-                start_y = 370
-                for i, key_name in enumerate(self.settings_rows):
-                    key  = key_name.lower().replace(" ", "_")
-                    val  = self._settings_value_str(key)
-                    sel  = (i == self.settings_index)
-                    col  = CYAN if sel else WHITE
-                    text = self.font_med.render(f"{key_name:<12s}  <  {val}  >",
-                                                True, col)
-                    tw, th = text.get_size()
-                    x = W // 2 - tw // 2
-                    y = start_y + i * row_h
-                    if sel:
-                        pygame.draw.rect(self.surf, (0, 60, 90),
-                                         (x - 16, y - 4, tw + 32, th + 8),
-                                         border_radius=4)
-                    self.surf.blit(text, (x, y))
+            head = self.font_med.render("SETTINGS", True, WHITE)
+            self.surf.blit(head, (W // 2 - head.get_width() // 2, 320))
 
-                hint1 = self.font_sm.render(
-                    "UP/DOWN: select  -  LEFT/RIGHT: change value",
-                    True, (160, 160, 160))
-                self.surf.blit(hint1, (W // 2 - hint1.get_width() // 2,
-                                       start_y + len(self.settings_rows) * row_h + 30))
+            row_h = 50
+            start_y = 370
+            for i, key_name in enumerate(self.settings_rows):
+                key  = key_name.lower().replace(" ", "_")
+                val  = self._settings_value_str(key)
+                if key == "bot_runners":
+                    max_bots = max(0, network.MAX_PLAYERS - self.server.count() - 1)
+                    if self.mp_settings[key] > max_bots:
+                        self.mp_settings[key] = max_bots
+                        val = str(max_bots)
+                sel  = (i == self.settings_index)
+                col  = CYAN if sel else WHITE
+                text = self.font_med.render(f"{key_name:<12s}  <  {val}  >", True, col)
+                tw, th = text.get_size()
+                x = W // 2 - tw // 2
+                y = start_y + i * row_h
+                if sel:
+                    pygame.draw.rect(self.surf, (0, 60, 90), (x - 16, y - 4, tw + 32, th + 8), border_radius=4)
+                self.surf.blit(text, (x, y))
+
+            hint1 = self.font_sm.render(
+                "UP/DOWN: select  -  LEFT/RIGHT: change value",
+                True, (160, 160, 160))
+            self.surf.blit(hint1, (W // 2 - hint1.get_width() // 2,
+                                   start_y + len(self.settings_rows) * row_h + 30))
 
             hint = self.font_med.render("SPACE = start  -  ESC = cancel",
                                         True, (200, 200, 200))
@@ -1212,6 +1264,49 @@ class Game:
 
             hint = self.font_sm.render("ESC = disconnect", True, (120, 120, 120))
             self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
+
+
+    def draw_lobby_map_vote(self):
+        self.surf.fill(BLACK)
+        title = self.font_xl.render("VOTE MAP", True, CYAN)
+        self.surf.blit(title, (W // 2 - title.get_width() // 2, 60))
+
+        time_left = max(0, int(self.mp_vote_timer))
+        time_text = self.font_lg.render(f"Time: {time_left}s", True, (255, 100, 100) if time_left <= 5 else WHITE)
+        self.surf.blit(time_text, (W // 2 - time_text.get_width() // 2, 120))
+
+        opt_h = 50
+        start_y = 220
+        # Calculate votes
+        vote_counts = [0] * len(self.mp_vote_options)
+        for v in self.mp_map_votes.values():
+            if 0 <= v < len(vote_counts):
+                vote_counts[v] += 1
+
+        for i, label in enumerate(self.mp_vote_options):
+            selected = (i == self.mp_vote_index)
+            color = CYAN if selected else WHITE
+            vc = vote_counts[i]
+            text = self.font_med.render(f"{label} ({vc} votes)", True, color)
+            tw, th = text.get_size()
+            x = W // 2 - tw // 2
+            y = start_y + i * opt_h
+
+            if selected:
+                pygame.draw.rect(self.surf, (0, 60, 90), (x - 20, y - 6, tw + 40, th + 12), border_radius=6)
+                pygame.draw.rect(self.surf, CYAN, (x - 20, y - 6, tw + 40, th + 12), 2, border_radius=6)
+
+            self.surf.blit(text, (x, y))
+
+            # Draw who voted for this
+            voters = [str(pid+1) if pid > 0 else "HOST" for pid, v in self.mp_map_votes.items() if v == i]
+            if voters:
+                v_text = self.font_sm.render(", ".join(voters), True, (160, 160, 160))
+                self.surf.blit(v_text, (x + tw + 30, y + th//2 - v_text.get_height()//2))
+
+        hint = self.font_sm.render("UP/DOWN: change  -  ENTER: confirm vote", True, (160, 160, 160))
+        self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
+
 
     def draw_menu(self):
         self.surf.fill(BLACK)
@@ -1295,6 +1390,86 @@ class Game:
         self.state            = "menu"
 
     # ── host: start a multiplayer match ───────────────────────────────────────
+
+    def host_start_dbd_match(self):
+        self.server.prune_dead()
+        self.new_level()
+        self.mp_generators = []
+        self.mp_freezing_pods = []
+        self.mp_winner = ""
+        self.mp_match_timer = DBD_MATCH_LENGTH
+        self.exit_unlocked = False
+        
+        slots = 1 + self.server.count() + self.mp_settings.get("bot_runners", 0)
+        self.mp_players = []
+        
+        # Load map
+        if self.mp_selected_map == 0:
+            # Random Map
+            self.walls = [[True]*COLS for _ in range(ROWS)]
+            # We already have new_level() generate self.walls
+            gen_pos, pod_pos, dbb_runner_spawns, dbb_hunter_spawn, dbb_exit_pos = [], [], [], None, None
+            
+            hunter_r, hunter_c = nearest_free(self.walls, ROWS // 2, COLS // 2, self.gates)
+            runner_spawns = [(1,1), (1,3), (3,1), (3,3)]
+            self.exit_pos = (ROWS-2, COLS-2)
+            
+            taken = [(hunter_r, hunter_c)]
+            for _ in range(DBD_GEN_COUNT):
+                cell = free_cell(self.walls, taken)
+                if cell: taken.append(cell); gen_pos.append(cell)
+            for _ in range(DBD_FREEZING_POD_COUNT):
+                cell = free_cell(self.walls, taken)
+                if cell: taken.append(cell); pod_pos.append(cell)
+                
+        else:
+            if self.mp_selected_map == 1:
+                (self.walls, gen_pos, pod_pos, runner_spawns, hunter_spawn, exit_pos) = maps.map_dbd.build_dbd_facility()
+            elif self.mp_selected_map == 2:
+                (self.walls, gen_pos, pod_pos, runner_spawns, hunter_spawn, exit_pos) = maps.map_dbd.build_dbd_facility_2()
+            else:
+                (self.walls, gen_pos, pod_pos, runner_spawns, hunter_spawn, exit_pos) = maps.map_dbd.build_dbd_facility_3()
+            
+            self.exit_pos = exit_pos
+            self.gates = []
+            self.build_gates()
+            self.portals = []
+            hunter_r, hunter_c = nearest_free(self.walls, *hunter_spawn, self.gates)
+
+        # Spawns
+        hunter_idx = random.randrange(slots)
+        runner_seen = 0
+        
+        # Human slots: 0 to server.count()
+        human_count = 1 + self.server.count()
+        for i in range(slots):
+            is_bot = i >= human_count
+            if i == hunter_idx:
+                r, c, role = hunter_r, hunter_c, "hunter"
+            else:
+                sr, sc = runner_spawns[runner_seen % len(runner_spawns)]
+                r, c = nearest_free(self.walls, sr, sc, self.gates)
+                role = "runner"
+                runner_seen += 1
+                
+            self.mp_players.append({
+                "id": i, "r": r, "c": c, "alive": True,
+                "role": role, "is_bot": is_bot,
+                "imprisoned": False, "imprison_remaining": 0.0,
+                "carried": False, "carry_timer": 0.0,
+                "carrying_pid": None, "catch_cooldown": 0.0,
+            })
+            self.mp_move_timers.append(0.0)
+
+        for cell in gen_pos:
+            self.mp_generators.append(Generator(cell[0], cell[1]))
+        for cell in pod_pos:
+            self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
+            
+        self.state = "mp_play"
+        self.server.broadcast({"type": "start", **self._serialize_state()})
+
+
     def host_start_match(self):
         """Host pressed SPACE — initialise level and broadcast maze + start."""
         # clean any dead connections BEFORE locking in player_id assignments
@@ -1627,7 +1802,8 @@ class Game:
                     self.maze_timer = 0.0
                     self.host_shift_maze()
 
-        else:  # DBD-MAZE or DBB — both share the hunter/gens/warehouses logic
+        else:  # DBD-MAZE or DBB — both share the hunter/gens/freezing_pods logic
+            self._bot_tick(dt)
             self._dbd_tick(dt)
             if self.state == "mp_end":
                 return
@@ -1642,6 +1818,110 @@ class Game:
             self.server.broadcast(self._serialize_state())
 
     # ── DBD core logic ────────────────────────────────────────────────────────
+
+    def _bot_tick(self, dt):
+        hunter = next((p for p in self.mp_players if p["role"] == "hunter" and p["alive"]), None)
+        hunter_pos = (hunter["r"], hunter["c"]) if hunter else None
+
+        for p in self.mp_players:
+            if not p.get("is_bot") or not p["alive"] or p.get("imprisoned") or p.get("carried"):
+                continue
+
+            pid = p["id"]
+            if pid not in self.mp_pending_input:
+                self.mp_pending_input[pid] = {"dr": 0, "dc": 0, "e_held": False}
+            inp = self.mp_pending_input[pid]
+            inp["e_held"] = False
+            inp["dr"], inp["dc"] = 0, 0
+
+            # Only process bot movement every MOVE_DELAY to prevent constant jittering if paths change
+            # Actually, mp_pending_input will just be applied normally in the main loop.
+            
+            # Distance to Hunter
+            dist_to_hunter = 999
+            if hunter_pos:
+                dist_to_hunter = abs(p["r"] - hunter_pos[0]) + abs(p["c"] - hunter_pos[1])
+
+            # 1. If Hunter is near AND NOT carrying someone, FLEE
+            if dist_to_hunter < 8 and not hunter.get("carrying_pid"):
+                best_dr, best_dc = 0, 0
+                max_d = dist_to_hunter
+                for dr, dc in ((0,1), (0,-1), (1,0), (-1,0)):
+                    nr, nc = p["r"] + dr, p["c"] + dc
+                    if not is_wall(self.walls, nr, nc, self.gates):
+                        nd = abs(nr - hunter_pos[0]) + abs(nc - hunter_pos[1])
+                        if nd > max_d:
+                            max_d = nd
+                            best_dr, best_dc = dr, dc
+                inp["dr"], inp["dc"] = best_dr, best_dc
+                continue
+
+            # 2. Follow hunter to rescue if carrying someone
+            if hunter and hunter.get("carrying_pid") and dist_to_hunter < 15:
+                # stay ~2 cells away
+                if dist_to_hunter > 2:
+                    path = bfs(self.walls, p["r"], p["c"], hunter_pos[0], hunter_pos[1], self.gates)
+                    if path:
+                        nr, nc = path[0]
+                        inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+                # Try to rescue if near freezing_pod
+                for w in self.mp_freezing_pods:
+                    if w.imprisoned_pid is not None and w.is_adjacent(p["r"], p["c"]):
+                        inp["e_held"] = True
+                        inp["dr"], inp["dc"] = 0, 0
+                continue
+
+            # 3. Rescue imprisoned teammate
+            imprisoned = [tp for tp in self.mp_players if tp.get("imprisoned") and tp["alive"]]
+            if imprisoned:
+                target_w = None
+                for w in self.mp_freezing_pods:
+                    if w.imprisoned_pid is not None:
+                        target_w = w
+                        break
+                if target_w:
+                    if target_w.is_adjacent(p["r"], p["c"]):
+                        inp["e_held"] = True
+                        inp["dr"], inp["dc"] = 0, 0
+                    else:
+                        path = bfs_adjacent(self.walls, p["r"], p["c"], target_w.r, target_w.c, self.gates)
+                        if path:
+                            nr, nc = path[0]
+                            inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+                    continue
+
+            # 4. Fix Generators
+            if not self.exit_unlocked:
+                best_gen, best_path = None, None
+                for gen in self.mp_generators:
+                    if not gen.completed:
+                        path = bfs_adjacent(self.walls, p["r"], p["c"], gen.r, gen.c, self.gates)
+                        if path is not None and (best_path is None or len(path) < len(best_path)):
+                            best_path = path
+                            best_gen = gen
+                
+                if best_gen:
+                    if best_gen.is_adjacent(p["r"], p["c"]):
+                        inp["e_held"] = True
+                        inp["dr"], inp["dc"] = 0, 0
+                    elif best_path:
+                        nr, nc = best_path[0]
+                        inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+                continue
+
+            # 5. Exit Unlocked, move to exit
+            if self.exit_unlocked:
+                path = bfs(self.walls, p["r"], p["c"], self.exit_pos[0], self.exit_pos[1], self.gates)
+                if path:
+                    nr, nc = path[0]
+                    gate_in_way = next((g for g in self.gates if g.r == nr and g.c == nc), None)
+                    if gate_in_way and not gate_in_way.is_open:
+                        if gate_in_way.is_adjacent(p["r"], p["c"]):
+                            inp["e_held"] = True
+                            inp["dr"], inp["dc"] = 0, 0
+                    else:
+                        inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+
     def _dbd_tick(self, dt):
         """Generators, catches, imprisonment, rescues, win conditions."""
         # match timer
@@ -1717,7 +1997,7 @@ class Game:
                 else:
                     hunter["carrying_pid"] = None
 
-        # rescue: any free runner adjacent to a warehouse holding an imprisoned one
+        # rescue: any free runner adjacent to a freezing_pod holding an imprisoned one
         for w in self.mp_freezing_pods:
             if w.imprisoned_pid is None:
                 continue
@@ -1755,10 +2035,10 @@ class Game:
         w.imprisoned_pid = runner["id"]
 
     def _imprison_runner(self, runner):
-        # find a warehouse without an imprisoned player
+        # find a freezing_pod without an imprisoned player
         free_wh = [w for w in self.mp_freezing_pods if w.imprisoned_pid is None]
         if not free_wh:
-            # all warehouses occupied — just kill them (edge case)
+            # all freezing_pods occupied — just kill them (edge case)
             runner["alive"] = False
             return
         w = random.choice(free_wh)
@@ -1772,7 +2052,7 @@ class Game:
             if p["id"] == w.imprisoned_pid:
                 p["imprisoned"] = False
                 p["imprison_remaining"] = 0.0
-                # bump them to an adjacent free cell so they aren't stuck on the warehouse
+                # bump them to an adjacent free cell so they aren't stuck on the freezing_pod
                 for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
                     nr, nc = w.r + dr, w.c + dc
                     if not is_wall(self.walls, nr, nc, self.gates):
@@ -2013,7 +2293,7 @@ class Game:
                 continue
             self._draw_dbb_generator(gen, to_screen)
 
-        # 4. warehouses
+        # 4. freezing_pods
         for w in self.mp_freezing_pods:
             if (w.r, w.c) not in visibility:
                 continue
@@ -2403,10 +2683,29 @@ class Game:
                             if self.server is not None:
                                 self.host_replay()
 
+
+                    elif self.state == "lobby_map_vote":
+                        if event.key in (pygame.K_UP, pygame.K_w):
+                            self.mp_vote_index = (self.mp_vote_index - 1) % len(self.mp_vote_options)
+                        elif event.key in (pygame.K_DOWN, pygame.K_s):
+                            self.mp_vote_index = (self.mp_vote_index + 1) % len(self.mp_vote_options)
+                        elif event.key == pygame.K_RETURN:
+                            self.mp_map_votes[self.player_id] = self.mp_vote_index
+                            if self.server:
+                                self.server.broadcast({"type": "votes_update", "votes": self.mp_map_votes})
+                            elif self.client:
+                                self.client.send({"type": "vote", "vote": self.mp_vote_index})
+
                     elif self.state == "lobby_wait_host":
                         if event.key == pygame.K_SPACE:
-                            self.host_start_match()
-                        elif self.mp_mode == "escape":
+                            if self.mp_mode == "dbd" or self.mp_mode == "dbb":
+                                self.state = "lobby_map_vote"
+                                self.mp_vote_timer = 15.0
+                                self.mp_map_votes = {}
+                                self.server.broadcast({"type": "start_vote"})
+                            else:
+                                self.host_start_match()
+                        else:
                             if event.key in (pygame.K_UP, pygame.K_w):
                                 self.settings_index = \
                                     (self.settings_index - 1) % len(self.settings_rows)
@@ -2475,6 +2774,38 @@ class Game:
                         self.maze_timer = 0.0
                         self.shift_maze()
 
+            elif self.state == "lobby_map_vote":
+                if self.server is not None:
+                    # Host handles vote packets
+                    for ci, msg in self.server.drain_all():
+                        if msg.get("type") == "vote":
+                            self.mp_map_votes[ci + 1] = msg.get("vote", 0)
+                            self.server.broadcast({"type": "votes_update", "votes": self.mp_map_votes})
+                    
+                    self.mp_vote_timer -= dt
+                    # Check if all human players voted
+                    human_count = self.server.count() + 1
+                    if len(self.mp_map_votes) >= human_count or self.mp_vote_timer <= 0:
+                        # end vote
+                        vote_counts = [0] * len(self.mp_vote_options)
+                        for v in self.mp_map_votes.values():
+                            if 0 <= v < len(vote_counts): vote_counts[v] += 1
+                        
+                        max_votes = max(vote_counts) if vote_counts else 0
+                        winners = [i for i, c in enumerate(vote_counts) if c == max_votes]
+                        import random
+                        self.mp_selected_map = random.choice(winners) if winners else 0
+                        
+                        self.host_start_dbd_match()
+                elif self.client is not None:
+                    for msg in self.client.drain():
+                        if msg.get("type") == "votes_update":
+                            self.mp_map_votes = msg.get("votes", {})
+                            # keys might be strings via json, convert to int
+                            self.mp_map_votes = {int(k): v for k, v in self.mp_map_votes.items()}
+                        elif msg.get("type") == "start":
+                            self.state = "mp_play"
+                            self._apply_state(msg)
             elif self.state == "lobby_wait_host" and self.server is not None:
                 # accept hellos, send welcomes
                 for ci, msg in self.server.drain_all():
@@ -2484,6 +2815,14 @@ class Game:
 
             elif self.state == "lobby_wait_client" and self.client is not None:
                 self.mp_client_tick(dt)
+                for msg in self.client.drain():
+                    if msg.get("type") == "start_vote":
+                        self.state = "lobby_map_vote"
+                        self.mp_vote_timer = 15.0
+                        self.mp_map_votes = {}
+                    elif msg.get("type") == "start":
+                        self.state = "mp_play"
+                        self._apply_state(msg)
 
             elif self.state == "mp_end":
                 # keep the client draining so it sees the host's REPLAY
@@ -2530,6 +2869,8 @@ class Game:
 
             elif self.state == "lobby_mode_pick":
                 self.draw_lobby_mode_pick()
+            elif self.state == "lobby_map_vote":
+                self.draw_lobby_map_vote()
 
             elif self.state == "lobby_join_input":
                 self.draw_lobby_join_input()

@@ -160,3 +160,99 @@ def build_dbd_facility():
     exit_pos = (5, 2)
 
     return walls, gen_positions, pod_positions, runner_spawns, hunter_spawn, exit_pos
+
+
+def build_dbd_facility_2():
+    walls = [[True] * COLS for _ in range(ROWS)]
+
+    def carve(r1, c1, r2, c2):
+        for r in range(r1, r2 + 1):
+            for c in range(c1, c2 + 1):
+                walls[r][c] = False
+
+    def door(r, c):
+        walls[r][c] = False
+
+    # Three large horizontal blocks
+    carve(2, 2, 10, 48)   # Top block
+    carve(13, 2, 21, 48)  # Mid block
+    carve(24, 2, 33, 48)  # Bottom block
+
+    # Vertical connectors
+    carve(11, 5, 12, 7)
+    carve(11, 43, 12, 45)
+    
+    carve(22, 24, 23, 26)
+
+    # Some internal walls to make it interesting
+    for r in range(2, 11):
+        walls[r][15] = True
+        walls[r][35] = True
+    door(5, 15)
+    door(8, 35)
+
+    for r in range(13, 22):
+        walls[r][25] = True
+    door(17, 25)
+
+    for r in range(24, 34):
+        walls[r][15] = True
+        walls[r][35] = True
+    door(30, 15)
+    door(26, 35)
+
+    gen_positions = [(5, 5), (17, 40), (28, 25), (6, 45)]
+    pod_positions = [(5, 25), (17, 5), (30, 5), (30, 45), (17, 45)]
+    runner_spawns = [(3, 3), (3, 4), (4, 3), (4, 4)]
+    hunter_spawn = (17, 26)
+    exit_pos = (30, 25)
+
+    return walls, gen_positions, pod_positions, runner_spawns, hunter_spawn, exit_pos
+
+
+def build_dbd_facility_3():
+    walls = [[True] * COLS for _ in range(ROWS)]
+
+    def carve(r1, c1, r2, c2):
+        for r in range(r1, r2 + 1):
+            for c in range(c1, c2 + 1):
+                walls[r][c] = False
+
+    def door(r, c):
+        walls[r][c] = False
+
+    # Three large vertical blocks
+    carve(2, 2, 33, 13)   # Left block
+    carve(2, 16, 33, 34)  # Center block
+    carve(2, 37, 33, 48)  # Right block
+
+    # Horizontal connectors
+    carve(5, 14, 7, 15)
+    carve(5, 35, 7, 36)
+    
+    carve(28, 14, 30, 15)
+    carve(28, 35, 30, 36)
+
+    # Internal walls
+    for c in range(2, 14):
+        walls[17][c] = True
+    door(17, 7)
+
+    for c in range(16, 35):
+        walls[12][c] = True
+        walls[24][c] = True
+    door(12, 25)
+    door(24, 25)
+
+    for c in range(37, 49):
+        walls[17][c] = True
+    door(17, 42)
+
+    gen_positions = [(5, 7), (30, 7), (18, 25), (5, 42)]
+    pod_positions = [(10, 7), (25, 7), (5, 25), (30, 25), (25, 42)]
+    runner_spawns = [(30, 42), (30, 43), (31, 42), (31, 43)]
+    hunter_spawn = (18, 26)
+    exit_pos = (5, 26)
+
+    return walls, gen_positions, pod_positions, runner_spawns, hunter_spawn, exit_pos
+
