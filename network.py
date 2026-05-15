@@ -5,7 +5,7 @@ Wire format: 4-byte big-endian length prefix + UTF-8 JSON.
 Each connection runs a background reader thread that decodes messages
 into an inbox deque; the main pygame loop polls non-blocking.
 
-Used by Maze.py — host runs a Server (and plays as player 0); each other
+Used by Maze.py — host runs a Server (and plays as player 0); each other 
 peer runs a Client that connects to the host's IP (Radmin VPN IP works
 just like a normal LAN IP).
 """

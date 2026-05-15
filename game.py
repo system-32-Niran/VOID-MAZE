@@ -116,6 +116,27 @@ def build_maze(rows, cols):
     return walls
 
 
+def build_maze_with_rooms(rows, cols, n_rooms=12, room_min=3, room_max=5):
+    """DFS perfect maze with N rectangular rooms carved into it.
+
+    The carved rooms break up the 1-cell-wide corridors so the layout has
+    real spaces players can maneuver in (closer to the DBD feel) instead of
+    single-file passages everywhere. Rooms are carved AFTER the DFS so they
+    can overlap or merge with corridors — that's intentional, it gives the
+    rooms organic openings."""
+    walls = build_maze(rows, cols)
+    for _ in range(n_rooms):
+        rw = random.randint(room_min, room_max)
+        rh = random.randint(room_min, room_max)
+        r = random.randint(2, max(2, rows - rh - 2))
+        c = random.randint(2, max(2, cols - rw - 2))
+        for rr in range(r, r + rh):
+            for cc in range(c, c + rw):
+                if 0 < rr < rows - 1 and 0 < cc < cols - 1:
+                    walls[rr][cc] = False
+    return walls
+
+
 # ── DBB (open map) constants ──────────────────────────────────────────────────
 DBB_COLS = 201
 DBB_ROWS = 141
@@ -1405,15 +1426,22 @@ class Game:
         
         # Load map
         if self.mp_selected_map == 0:
-            # Random Map
-            self.walls = [[True]*COLS for _ in range(ROWS)]
-            # We already have new_level() generate self.walls
-            gen_pos, pod_pos, dbb_runner_spawns, dbb_hunter_spawn, dbb_exit_pos = [], [], [], None, None
-            
+            # Random Map: DFS maze + carved rectangular rooms (so the layout
+            # has actual open spaces players can maneuver in, not 1-cell-wide
+            # corridors everywhere).
+            # Previously this branch did `self.walls = [[True]*COLS ...]` which
+            # turned the entire grid into walls — that's why the random map
+            # appeared blank/broken.
+            self.walls = build_maze_with_rooms(ROWS, COLS)
+            self.gates = []
+            self.build_gates()
+            self.portals = []
+            gen_pos, pod_pos = [], []
+
             hunter_r, hunter_c = nearest_free(self.walls, ROWS // 2, COLS // 2, self.gates)
-            runner_spawns = [(1,1), (1,3), (3,1), (3,3)]
-            self.exit_pos = (ROWS-2, COLS-2)
-            
+            runner_spawns = [(1, 1), (1, 3), (3, 1), (3, 3)]
+            self.exit_pos = nearest_free(self.walls, ROWS - 2, COLS - 2, self.gates)
+
             taken = [(hunter_r, hunter_c)]
             for _ in range(DBD_GEN_COUNT):
                 cell = free_cell(self.walls, taken)
@@ -1458,6 +1486,11 @@ class Game:
                 "imprisoned": False, "imprison_remaining": 0.0,
                 "carried": False, "carry_timer": 0.0,
                 "carrying_pid": None, "catch_cooldown": 0.0,
+                # AI state — only used for bots. Each bot commits to its
+                # current "ai_state" until "ai_timer" hits 0 (anti-oscillation).
+                "ai_state":     "idle",
+                "ai_timer":     0.0,
+                "ai_target_id": None,
             })
             self.mp_move_timers.append(0.0)
 
@@ -1819,108 +1852,206 @@ class Game:
 
     # ── DBD core logic ────────────────────────────────────────────────────────
 
+    # ── bot AI tunables ───────────────────────────────────────────────────────
+    # The runner FLEE state commits for FLEE_COMMIT seconds; the runner only
+    # leaves FLEE once the timer hits 0 AND the hunter is at least
+    # SAFE_DIST cells away. This hysteresis is what stops the
+    # "repair → see hunter → flee 1 cell → see hunter further → repair → ..."
+    # oscillation loop.
+    BOT_FLEE_TRIGGER_DIST = 6   # enter FLEE when hunter ≤ this many cells away
+    BOT_FLEE_SAFE_DIST    = 12  # only exit FLEE when hunter ≥ this many cells
+    BOT_FLEE_COMMIT_SEC   = 4.0 # min seconds to stay in FLEE
+    BOT_HUNTER_COMMIT_SEC = 3.0 # hunter sticks with one target this long
+
     def _bot_tick(self, dt):
-        hunter = next((p for p in self.mp_players if p["role"] == "hunter" and p["alive"]), None)
-        hunter_pos = (hunter["r"], hunter["c"]) if hunter else None
+        """Generate inputs for all bot players (runners and hunter).
+
+        Anti-oscillation strategy:
+        - Runner bots commit to FLEE for `BOT_FLEE_COMMIT_SEC`. They only return
+          to repair / rescue when the timer expires AND the hunter is at least
+          `BOT_FLEE_SAFE_DIST` away (hysteresis on the distance threshold).
+        - Hunter bot commits to a single target for `BOT_HUNTER_COMMIT_SEC`
+          before considering a switch — prevents flicker when 2 runners are
+          equidistant or running in opposite directions.
+        """
+        hunter = next((p for p in self.mp_players
+                       if p["role"] == "hunter" and p["alive"]), None)
 
         for p in self.mp_players:
-            if not p.get("is_bot") or not p["alive"] or p.get("imprisoned") or p.get("carried"):
+            if not p.get("is_bot"):
+                continue
+            pid = p["id"]
+
+            # Imprisoned / carried bots can't act — clear input so they don't
+            # carry a stale dr/dc from earlier frames.
+            if not p["alive"] or p.get("imprisoned") or p.get("carried"):
+                self.mp_pending_input[pid] = {"dr": 0, "dc": 0, "e_held": False}
                 continue
 
-            pid = p["id"]
+            # Decrement state-commitment timer
+            p["ai_timer"] = max(0.0, p.get("ai_timer", 0.0) - dt)
+
             if pid not in self.mp_pending_input:
                 self.mp_pending_input[pid] = {"dr": 0, "dc": 0, "e_held": False}
             inp = self.mp_pending_input[pid]
-            inp["e_held"] = False
-            inp["dr"], inp["dc"] = 0, 0
+            inp["dr"], inp["dc"], inp["e_held"] = 0, 0, False
 
-            # Only process bot movement every MOVE_DELAY to prevent constant jittering if paths change
-            # Actually, mp_pending_input will just be applied normally in the main loop.
-            
-            # Distance to Hunter
-            dist_to_hunter = 999
-            if hunter_pos:
-                dist_to_hunter = abs(p["r"] - hunter_pos[0]) + abs(p["c"] - hunter_pos[1])
+            if p["role"] == "hunter":
+                self._bot_hunter_tick(p, inp)
+            else:
+                self._bot_runner_tick(p, hunter, inp)
 
-            # 1. If Hunter is near AND NOT carrying someone, FLEE
-            if dist_to_hunter < 8 and not hunter.get("carrying_pid"):
+    def _bot_hunter_tick(self, p, inp):
+        """Hunter bot: BFS-chase the committed target runner.
+
+        The hunter keeps the same target for `BOT_HUNTER_COMMIT_SEC` seconds.
+        Only when that timer expires (or the target dies / is imprisoned /
+        gets carried by another hunter — irrelevant in DBD-MAZE) does it
+        repick the nearest fresh runner.
+        """
+        # Resolve current target if commitment is still alive
+        cur_target = None
+        if p.get("ai_target_id") is not None and p.get("ai_timer", 0.0) > 0:
+            cur_target = next((x for x in self.mp_players
+                               if x["id"] == p["ai_target_id"]
+                               and x["alive"]
+                               and not x.get("imprisoned")
+                               and not x.get("carried")), None)
+
+        if cur_target is None:
+            candidates = [x for x in self.mp_players
+                          if x.get("role") == "runner"
+                          and x["alive"]
+                          and not x.get("imprisoned")
+                          and not x.get("carried")]
+            if not candidates:
+                return
+            cur_target = min(
+                candidates,
+                key=lambda x: abs(x["r"] - p["r"]) + abs(x["c"] - p["c"])
+            )
+            p["ai_target_id"] = cur_target["id"]
+            p["ai_timer"]     = self.BOT_HUNTER_COMMIT_SEC
+
+        path = bfs(self.walls, p["r"], p["c"],
+                   cur_target["r"], cur_target["c"], self.gates)
+        if path:
+            nr, nc = path[0]
+            inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+
+    def _bot_runner_tick(self, p, hunter, inp):
+        """Runner bot with FLEE-commit hysteresis.
+
+        Decision order:
+          1. FLEE state — committed for at least BOT_FLEE_COMMIT_SEC; exit
+             only when hunter is BOT_FLEE_SAFE_DIST away.
+          2. Help carried teammates by following the hunter (rescue chance).
+          3. Rescue imprisoned teammates from freezing pods.
+          4. Repair the nearest unfinished generator.
+          5. Head for the exit if it's unlocked.
+        """
+        hdist = 999
+        if hunter and hunter["alive"]:
+            hdist = abs(p["r"] - hunter["r"]) + abs(p["c"] - hunter["c"])
+
+        state = p.get("ai_state", "idle")
+
+        # ── 1. FLEE state transitions (hysteresis) ────────────────────────────
+        if state != "flee" \
+                and hdist <= self.BOT_FLEE_TRIGGER_DIST \
+                and not (hunter and hunter.get("carrying_pid")):
+            # Hunter is close and not busy carrying someone — commit to flee.
+            p["ai_state"] = "flee"
+            p["ai_timer"] = self.BOT_FLEE_COMMIT_SEC
+            state = "flee"
+        elif state == "flee" and p["ai_timer"] <= 0:
+            if hdist >= self.BOT_FLEE_SAFE_DIST:
+                p["ai_state"] = "idle"
+                state = "idle"
+            else:
+                # Still not safe — refresh the commitment instead of bouncing
+                # back to repair only to immediately re-flee next frame.
+                p["ai_timer"] = self.BOT_FLEE_COMMIT_SEC / 2
+
+        # ── 2. Execute FLEE ──────────────────────────────────────────────────
+        if state == "flee":
+            if hunter:
+                best_d = -1
                 best_dr, best_dc = 0, 0
-                max_d = dist_to_hunter
-                for dr, dc in ((0,1), (0,-1), (1,0), (-1,0)):
+                for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
                     nr, nc = p["r"] + dr, p["c"] + dc
-                    if not is_wall(self.walls, nr, nc, self.gates):
-                        nd = abs(nr - hunter_pos[0]) + abs(nc - hunter_pos[1])
-                        if nd > max_d:
-                            max_d = nd
-                            best_dr, best_dc = dr, dc
-                inp["dr"], inp["dc"] = best_dr, best_dc
-                continue
+                    if is_wall(self.walls, nr, nc, self.gates):
+                        continue
+                    d = abs(nr - hunter["r"]) + abs(nc - hunter["c"])
+                    if d > best_d:
+                        best_d = d
+                        best_dr, best_dc = dr, dc
+                if best_d >= 0:
+                    inp["dr"], inp["dc"] = best_dr, best_dc
+            return
 
-            # 2. Follow hunter to rescue if carrying someone
-            if hunter and hunter.get("carrying_pid") and dist_to_hunter < 15:
-                # stay ~2 cells away
-                if dist_to_hunter > 2:
-                    path = bfs(self.walls, p["r"], p["c"], hunter_pos[0], hunter_pos[1], self.gates)
-                    if path:
-                        nr, nc = path[0]
-                        inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
-                # Try to rescue if near freezing_pod
-                for w in self.mp_freezing_pods:
-                    if w.imprisoned_pid is not None and w.is_adjacent(p["r"], p["c"]):
-                        inp["e_held"] = True
-                        inp["dr"], inp["dc"] = 0, 0
-                continue
-
-            # 3. Rescue imprisoned teammate
-            imprisoned = [tp for tp in self.mp_players if tp.get("imprisoned") and tp["alive"]]
-            if imprisoned:
-                target_w = None
-                for w in self.mp_freezing_pods:
-                    if w.imprisoned_pid is not None:
-                        target_w = w
-                        break
-                if target_w:
-                    if target_w.is_adjacent(p["r"], p["c"]):
-                        inp["e_held"] = True
-                        inp["dr"], inp["dc"] = 0, 0
-                    else:
-                        path = bfs_adjacent(self.walls, p["r"], p["c"], target_w.r, target_w.c, self.gates)
-                        if path:
-                            nr, nc = path[0]
-                            inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
-                    continue
-
-            # 4. Fix Generators
-            if not self.exit_unlocked:
-                best_gen, best_path = None, None
-                for gen in self.mp_generators:
-                    if not gen.completed:
-                        path = bfs_adjacent(self.walls, p["r"], p["c"], gen.r, gen.c, self.gates)
-                        if path is not None and (best_path is None or len(path) < len(best_path)):
-                            best_path = path
-                            best_gen = gen
-                
-                if best_gen:
-                    if best_gen.is_adjacent(p["r"], p["c"]):
-                        inp["e_held"] = True
-                        inp["dr"], inp["dc"] = 0, 0
-                    elif best_path:
-                        nr, nc = best_path[0]
-                        inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
-                continue
-
-            # 5. Exit Unlocked, move to exit
-            if self.exit_unlocked:
-                path = bfs(self.walls, p["r"], p["c"], self.exit_pos[0], self.exit_pos[1], self.gates)
+        # ── 3. Help carried teammate (shadow the hunter to ambush a rescue) ───
+        if hunter and hunter.get("carrying_pid") and hdist < 15:
+            if hdist > 2:
+                path = bfs(self.walls, p["r"], p["c"],
+                           hunter["r"], hunter["c"], self.gates)
                 if path:
                     nr, nc = path[0]
-                    gate_in_way = next((g for g in self.gates if g.r == nr and g.c == nc), None)
-                    if gate_in_way and not gate_in_way.is_open:
-                        if gate_in_way.is_adjacent(p["r"], p["c"]):
-                            inp["e_held"] = True
-                            inp["dr"], inp["dc"] = 0, 0
-                    else:
-                        inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+                    inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+            for w in self.mp_freezing_pods:
+                if w.imprisoned_pid is not None and w.is_adjacent(p["r"], p["c"]):
+                    inp["e_held"] = True
+                    inp["dr"], inp["dc"] = 0, 0
+            return
+
+        # ── 4. Rescue imprisoned teammates ───────────────────────────────────
+        target_pod = None
+        for w in self.mp_freezing_pods:
+            if w.imprisoned_pid is not None:
+                target_pod = w
+                break
+        if target_pod is not None:
+            if target_pod.is_adjacent(p["r"], p["c"]):
+                inp["e_held"] = True
+            else:
+                path = bfs_adjacent(self.walls, p["r"], p["c"],
+                                    target_pod.r, target_pod.c, self.gates)
+                if path:
+                    nr, nc = path[0]
+                    inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+            return
+
+        # ── 5. Repair the closest unfinished generator ───────────────────────
+        if not self.exit_unlocked:
+            best_gen, best_path = None, None
+            for gen in self.mp_generators:
+                if gen.completed:
+                    continue
+                path = bfs_adjacent(self.walls, p["r"], p["c"],
+                                    gen.r, gen.c, self.gates)
+                if path is not None and (best_path is None or len(path) < len(best_path)):
+                    best_path = path
+                    best_gen  = gen
+            if best_gen:
+                if best_gen.is_adjacent(p["r"], p["c"]):
+                    inp["e_held"] = True
+                elif best_path:
+                    nr, nc = best_path[0]
+                    inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+            return
+
+        # ── 6. Exit unlocked — head to the exit ──────────────────────────────
+        path = bfs(self.walls, p["r"], p["c"],
+                   self.exit_pos[0], self.exit_pos[1], self.gates)
+        if path:
+            nr, nc = path[0]
+            gate_in_way = next((g for g in self.gates
+                                if g.r == nr and g.c == nc), None)
+            if gate_in_way and not gate_in_way.is_open:
+                if gate_in_way.is_adjacent(p["r"], p["c"]):
+                    inp["e_held"] = True
+            else:
+                inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
 
     def _dbd_tick(self, dt):
         """Generators, catches, imprisonment, rescues, win conditions."""
