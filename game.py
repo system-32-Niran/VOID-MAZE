@@ -149,6 +149,7 @@ DBB_CELL = max(20, min((SCREEN_W - PANEL_W) // 28, SCREEN_H // 18))
 DBB_FOV_DEG       = 120     # full angular width of the front cone
 DBB_FRONT_RADIUS  = 14      # cells visible inside the front cone
 DBB_BACK_RADIUS   = 20       # cells faintly visible behind the player
+DBB_SHADOW_ALPHA  = 70      # dim map readability for cells hidden by cover
 DBB_OBSTACLE_CLUSTERS = 240 # number of small wall clusters scattered across the map
 
 
@@ -211,14 +212,14 @@ def _angle_diff(a, b):
     return (a - b + math.pi) % math.tau - math.pi
 
 
-def compute_dbb_fov(walls, pr, pc, facing_angle):
+def compute_dbb_fov(walls, pr, pc, facing_angle, block_los=True):
     """Returns {(r, c): alpha 0..255} for cells visible from (pr, pc).
 
     - Inside the front 120 deg cone: visible up to DBB_FRONT_RADIUS cells.
       Alpha falls off with both distance and angular offset from the centerline.
     - Behind the player: a small DBB_BACK_RADIUS halo with quick fade.
-    - Cells whose direct line from the player crosses a wall are hidden
-      (shadow casting / cover).
+    - With block_los=True, cells whose direct line from the player crosses a
+      wall are hidden (used for actor visibility / cover).
     """
     visibility = {}
     max_r = max(DBB_FRONT_RADIUS, DBB_BACK_RADIUS)
@@ -255,7 +256,7 @@ def compute_dbb_fov(walls, pr, pc, facing_angle):
                 radial = 1.0 - dist / DBB_BACK_RADIUS
                 alpha  = int(35 + 90 * radial)
 
-            if not line_of_sight(walls, pr, pc, cr, cc):
+            if block_los and not line_of_sight(walls, pr, pc, cr, cc):
                 continue
             visibility[(cr, cc)] = alpha
     return visibility
@@ -375,6 +376,28 @@ def bfs(walls, sr, sc, tr, tc, gates=None):
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
+def bfs_distances(walls, sr, sc, gates=None):
+    rows = len(walls)
+    cols = len(walls[0]) if rows else 0
+    dist = [[-1] * cols for _ in range(rows)]
+    if sr < 0 or sr >= rows or sc < 0 or sc >= cols:
+        return dist
+    if is_wall(walls, sr, sc, gates):
+        return dist
+
+    q = deque([(sr, sc)])
+    dist[sr][sc] = 0
+    while q:
+        r, c = q.popleft()
+        for dr, dc in ((0,1),(1,0),(0,-1),(-1,0)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if not is_wall(walls, nr, nc, gates) and dist[nr][nc] == -1:
+                    dist[nr][nc] = dist[r][c] + 1
+                    q.append((nr, nc))
+    return dist
+
+
 def free_cell(walls, exclude=None):
     """Pick a random free interior cell. For maze grids step by 2 (odd cells),
     for arbitrary grids (DBB) just sample anywhere in the interior."""
@@ -742,6 +765,7 @@ class Game:
         # whenever the local player presses a movement key.
         self.dbb_facing_angle = math.pi / 2   # default: facing down (+row)
         self.dbb_cached_fov   = {}            # last computed visibility dict
+        self.dbb_cached_map_fov = {}          # map readability without LOS blocking
         self.dbb_fov_pr       = None          # cell where the FOV was computed
         self.dbb_fov_pc       = None
         self.dbb_fov_facing   = None
@@ -1491,6 +1515,7 @@ class Game:
                 "ai_state":     "idle",
                 "ai_timer":     0.0,
                 "ai_target_id": None,
+                "ai_recent":    [],
             })
             self.mp_move_timers.append(0.0)
 
@@ -1636,6 +1661,7 @@ class Game:
 
             # Reset local FOV cache so the first frame computes fresh.
             self.dbb_cached_fov = {}
+            self.dbb_cached_map_fov = {}
             self.dbb_fov_pr = None
             self.dbb_fov_pc = None
             self.dbb_fov_facing = None
@@ -1675,6 +1701,11 @@ class Game:
                         for r, c, pi, co in msg["portals"]]
         self.mp_generators = [Generator(r, c) for r, c in msg.get("generators", [])]
         self.mp_freezing_pods = [FreezingPod(r, c) for r, c in msg.get("freezing_pods", [])]
+        self.dbb_cached_fov = {}
+        self.dbb_cached_map_fov = {}
+        self.dbb_fov_pr = None
+        self.dbb_fov_pc = None
+        self.dbb_fov_facing = None
 
     def _serialize_state(self):
         hunter_pos = None
@@ -1876,6 +1907,14 @@ class Game:
         """
         hunter = next((p for p in self.mp_players
                        if p["role"] == "hunter" and p["alive"]), None)
+        hunter_dist = None
+        if hunter is not None:
+            hunter_dist = bfs_distances(self.walls, hunter["r"], hunter["c"], self.gates)
+        runner_positions = [(x["id"], x["r"], x["c"]) for x in self.mp_players
+                            if x.get("role") == "runner"
+                            and x["alive"]
+                            and not x.get("imprisoned")
+                            and not x.get("carried")]
 
         for p in self.mp_players:
             if not p.get("is_bot"):
@@ -1890,6 +1929,7 @@ class Game:
 
             # Decrement state-commitment timer
             p["ai_timer"] = max(0.0, p.get("ai_timer", 0.0) - dt)
+            p.setdefault("ai_recent", [])
 
             if pid not in self.mp_pending_input:
                 self.mp_pending_input[pid] = {"dr": 0, "dc": 0, "e_held": False}
@@ -1899,7 +1939,7 @@ class Game:
             if p["role"] == "hunter":
                 self._bot_hunter_tick(p, inp)
             else:
-                self._bot_runner_tick(p, hunter, inp)
+                self._bot_runner_tick(p, hunter, inp, hunter_dist, runner_positions)
 
     def _bot_hunter_tick(self, p, inp):
         """Hunter bot: BFS-chase the committed target runner.
@@ -1909,6 +1949,22 @@ class Game:
         gets carried by another hunter — irrelevant in DBD-MAZE) does it
         repick the nearest fresh runner.
         """
+        if p.get("carrying_pid") is not None:
+            best_path = None
+            for w in self.mp_freezing_pods:
+                if w.imprisoned_pid is not None:
+                    continue
+                path = bfs_adjacent(self.walls, p["r"], p["c"], w.r, w.c, self.gates)
+                if path is not None and (best_path is None or len(path) < len(best_path)):
+                    best_path = path
+            p["ai_state"] = "carry"
+            p["ai_target_id"] = None
+            p["ai_timer"] = 0.0
+            if best_path:
+                nr, nc = best_path[0]
+                inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+            return
+
         # Resolve current target if commitment is still alive
         cur_target = None
         if p.get("ai_target_id") is not None and p.get("ai_timer", 0.0) > 0:
@@ -1918,28 +1974,34 @@ class Game:
                                and not x.get("imprisoned")
                                and not x.get("carried")), None)
 
-        if cur_target is None:
+        path = None
+        if cur_target is not None:
+            path = bfs(self.walls, p["r"], p["c"],
+                       cur_target["r"], cur_target["c"], self.gates)
+
+        if cur_target is None or path is None:
             candidates = [x for x in self.mp_players
                           if x.get("role") == "runner"
                           and x["alive"]
                           and not x.get("imprisoned")
                           and not x.get("carried")]
-            if not candidates:
+            best_target, best_path = None, None
+            for x in candidates:
+                candidate_path = bfs(self.walls, p["r"], p["c"], x["r"], x["c"], self.gates)
+                if candidate_path is not None and (best_path is None or len(candidate_path) < len(best_path)):
+                    best_target, best_path = x, candidate_path
+            if best_target is None:
+                p["ai_target_id"] = None
                 return
-            cur_target = min(
-                candidates,
-                key=lambda x: abs(x["r"] - p["r"]) + abs(x["c"] - p["c"])
-            )
+            cur_target, path = best_target, best_path
             p["ai_target_id"] = cur_target["id"]
             p["ai_timer"]     = self.BOT_HUNTER_COMMIT_SEC
 
-        path = bfs(self.walls, p["r"], p["c"],
-                   cur_target["r"], cur_target["c"], self.gates)
         if path:
             nr, nc = path[0]
             inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
 
-    def _bot_runner_tick(self, p, hunter, inp):
+    def _bot_runner_tick(self, p, hunter, inp, hunter_dist, runner_positions):
         """Runner bot with FLEE-commit hysteresis.
 
         Decision order:
@@ -1951,8 +2013,10 @@ class Game:
           5. Head for the exit if it's unlocked.
         """
         hdist = 999
-        if hunter and hunter["alive"]:
-            hdist = abs(p["r"] - hunter["r"]) + abs(p["c"] - hunter["c"])
+        if hunter and hunter["alive"] and hunter_dist is not None:
+            hdist = hunter_dist[p["r"]][p["c"]]
+            if hdist < 0:
+                hdist = 999
 
         state = p.get("ai_state", "idle")
 
@@ -1976,18 +2040,40 @@ class Game:
         # ── 2. Execute FLEE ──────────────────────────────────────────────────
         if state == "flee":
             if hunter:
-                best_d = -1
+                recent = p.get("ai_recent", [])
+                best_score = -10 ** 9
                 best_dr, best_dc = 0, 0
                 for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
                     nr, nc = p["r"] + dr, p["c"] + dc
                     if is_wall(self.walls, nr, nc, self.gates):
                         continue
-                    d = abs(nr - hunter["r"]) + abs(nc - hunter["c"])
-                    if d > best_d:
-                        best_d = d
+                    if hunter_dist is not None:
+                        d = hunter_dist[nr][nc]
+                        if d < 0:
+                            d = 999
+                    else:
+                        d = abs(nr - hunter["r"]) + abs(nc - hunter["c"])
+                    score = d
+                    if d <= hdist:
+                        score -= 2
+                    if (nr, nc) in recent:
+                        score -= 4
+                    for rid, rr, rc in runner_positions:
+                        if rid == p["id"]:
+                            continue
+                        sep = abs(nr - rr) + abs(nc - rc)
+                        if sep == 0:
+                            score -= 8
+                        elif sep <= 2:
+                            score -= (3 - sep) * 2
+                    score += ((nr * 17 + nc * 31 + p["id"] * 13) % 5) * 0.01
+                    if score > best_score:
+                        best_score = score
                         best_dr, best_dc = dr, dc
-                if best_d >= 0:
+                if best_score > -10 ** 9:
                     inp["dr"], inp["dc"] = best_dr, best_dc
+                    recent.append((p["r"] + best_dr, p["c"] + best_dc))
+                    del recent[:-6]
             return
 
         # ── 3. Help carried teammate (shadow the hunter to ambush a rescue) ───
@@ -2393,11 +2479,13 @@ class Game:
         # Recompute FOV only when position or facing changed (the calc is
         # quadratic in radius — cheap, but skipping it on still frames is free).
         if (pr, pc, facing) != (self.dbb_fov_pr, self.dbb_fov_pc, self.dbb_fov_facing):
-            self.dbb_cached_fov = compute_dbb_fov(self.walls, pr, pc, facing)
+            self.dbb_cached_fov = compute_dbb_fov(self.walls, pr, pc, facing, True)
+            self.dbb_cached_map_fov = compute_dbb_fov(self.walls, pr, pc, facing, False)
             self.dbb_fov_pr     = pr
             self.dbb_fov_pc     = pc
             self.dbb_fov_facing = facing
         visibility = self.dbb_cached_fov
+        map_visibility = self.dbb_cached_map_fov
 
         # 1. dark background everywhere (anything we don't draw stays pitch black)
         self.surf.fill(BLACK)
@@ -2405,7 +2493,7 @@ class Game:
         # 2. floor + walls — only inside the visibility set
         rows = len(self.walls)
         cols = len(self.walls[0]) if rows else 0
-        for (r, c), _alpha in visibility.items():
+        for (r, c), _alpha in map_visibility.items():
             if not (0 <= r < rows and 0 <= c < cols):
                 continue
             x, y = to_screen(r, c)
@@ -2420,18 +2508,18 @@ class Game:
         # 3. generators (use Generator.draw, which uses cell_xy — for DBB we
         #    bypass that and draw inline so we can use the camera transform)
         for gen in self.mp_generators:
-            if (gen.r, gen.c) not in visibility:
+            if (gen.r, gen.c) not in map_visibility:
                 continue
             self._draw_dbb_generator(gen, to_screen)
 
         # 4. freezing_pods
         for w in self.mp_freezing_pods:
-            if (w.r, w.c) not in visibility:
+            if (w.r, w.c) not in map_visibility:
                 continue
             self._draw_dbb_freezing_pod(w, to_screen)
 
         # 5. exit (always draw if cell is visible)
-        if self.exit_pos in visibility:
+        if self.exit_pos in map_visibility:
             ex, ey = to_screen(*self.exit_pos)
             size = int(DBB_CELL * 0.35)
             points = [(ex, ey - size), (ex + size, ey),
@@ -2487,12 +2575,13 @@ class Game:
         #    centre of the cone. Drawn over only the play area (left of panel).
         fog = pygame.Surface((play_w, play_h), pygame.SRCALPHA)
         fog.fill((0, 0, 0, 255))
-        for (r, c), alpha in visibility.items():
+        for (r, c), alpha in map_visibility.items():
             x, y = to_screen(r, c)
             if x + DBB_CELL // 2 < 0 or x - DBB_CELL // 2 > play_w:
                 continue
             if y + DBB_CELL // 2 < 0 or y - DBB_CELL // 2 > play_h:
                 continue
+            alpha = visibility.get((r, c), min(alpha, DBB_SHADOW_ALPHA))
             inv = max(0, 255 - alpha)
             rect = pygame.Rect(x - DBB_CELL // 2, y - DBB_CELL // 2,
                                DBB_CELL, DBB_CELL)
