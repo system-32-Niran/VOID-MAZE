@@ -262,20 +262,36 @@ def compute_dbb_fov(walls, pr, pc, facing_angle, block_los=True):
     return visibility
 
 
-def is_wall(walls, r, c, gates=None):
-    """Return True if (r,c) is a wall.  Open gates are treated as passable.
-    Bounds are derived from `walls` so this helper works for any map size."""
+def gate_at(gates, r, c):
+    if gates:
+        for g in gates:
+            if g.r == r and g.c == c:
+                return g
+    return None
+
+
+def is_wall_for_path(walls, r, c, gates=None, closed_gates_passable=False):
+    """Return True if (r,c) blocks movement/pathing.
+
+    Normal movement treats closed gates as walls. Bot planning can opt into
+    treating closed gates as passable waypoints, then hold E when it reaches one.
+    """
     rows = len(walls)
     cols = len(walls[0]) if rows else 0
     if r < 0 or r >= rows or c < 0 or c >= cols:
         return True
     if walls[r][c]:
-        if gates:
-            for g in gates:
-                if g.r == r and g.c == c and g.is_open:
-                    return False
+        gate = gate_at(gates, r, c)
+        if gate and (gate.is_open or closed_gates_passable):
+            return False
         return True
     return False
+
+
+def is_wall(walls, r, c, gates=None):
+    """Return True if (r,c) is a wall.  Open gates are treated as passable.
+    Bounds are derived from `walls` so this helper works for any map size."""
+    return is_wall_for_path(walls, r, c, gates, False)
 
 
 # ── nearest free cell ─────────────────────────────────────────────────────────
@@ -302,7 +318,7 @@ def nearest_free(walls, r, c, gates=None):
 
 # ── bfs for hunter ────────────────────────────────────────────────────────────
 
-def bfs_adjacent(walls, sr, sc, tr, tc, gates=None):
+def bfs_adjacent(walls, sr, sc, tr, tc, gates=None, closed_gates_passable=False):
     if abs(sr - tr) + abs(sc - tc) == 1:
         return []
         
@@ -323,7 +339,7 @@ def bfs_adjacent(walls, sr, sc, tr, tc, gates=None):
         for dr, dc in ((0,1),(1,0),(0,-1),(-1,0)):
             nr, nc = r + dr, c + dc
             if 0 <= nr < rows and 0 <= nc < cols:
-                if not is_wall(walls, nr, nc, gates) and dist[nr][nc] == -1:
+                if not is_wall_for_path(walls, nr, nc, gates, closed_gates_passable) and dist[nr][nc] == -1:
                     dist[nr][nc] = dist[r][c] + 1
                     prev[nr][nc] = (r, c)
                     q.append((nr, nc))
@@ -340,7 +356,7 @@ def bfs_adjacent(walls, sr, sc, tr, tc, gates=None):
     return path
 
 
-def bfs(walls, sr, sc, tr, tc, gates=None):
+def bfs(walls, sr, sc, tr, tc, gates=None, closed_gates_passable=False):
     rows = len(walls)
     cols = len(walls[0]) if rows else 0
     if (sr, sc) == (tr, tc):
@@ -359,7 +375,7 @@ def bfs(walls, sr, sc, tr, tc, gates=None):
         for dr, dc in ((0,1),(1,0),(0,-1),(-1,0)):
             nr, nc = r + dr, c + dc
             if 0 <= nr < rows and 0 <= nc < cols:
-                if not is_wall(walls, nr, nc, gates) and dist[nr][nc] == -1:
+                if not is_wall_for_path(walls, nr, nc, gates, closed_gates_passable) and dist[nr][nc] == -1:
                     dist[nr][nc] = dist[r][c] + 1
                     prev[nr][nc] = (r, c)
                     q.append((nr, nc))
@@ -376,13 +392,13 @@ def bfs(walls, sr, sc, tr, tc, gates=None):
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
-def bfs_distances(walls, sr, sc, gates=None):
+def bfs_distances(walls, sr, sc, gates=None, closed_gates_passable=False):
     rows = len(walls)
     cols = len(walls[0]) if rows else 0
     dist = [[-1] * cols for _ in range(rows)]
     if sr < 0 or sr >= rows or sc < 0 or sc >= cols:
         return dist
-    if is_wall(walls, sr, sc, gates):
+    if is_wall_for_path(walls, sr, sc, gates, closed_gates_passable):
         return dist
 
     q = deque([(sr, sc)])
@@ -392,7 +408,7 @@ def bfs_distances(walls, sr, sc, gates=None):
         for dr, dc in ((0,1),(1,0),(0,-1),(-1,0)):
             nr, nc = r + dr, c + dc
             if 0 <= nr < rows and 0 <= nc < cols:
-                if not is_wall(walls, nr, nc, gates) and dist[nr][nc] == -1:
+                if not is_wall_for_path(walls, nr, nc, gates, closed_gates_passable) and dist[nr][nc] == -1:
                     dist[nr][nc] = dist[r][c] + 1
                     q.append((nr, nc))
     return dist
@@ -753,6 +769,7 @@ class Game:
         self.mp_local_input   = {"dr": 0, "dc": 0, "e_held": False}  # client-side
         self.mp_send_timer    = 0.0   # client throttle for sending input
         self.mp_broadcast_timer = 0.0 # host throttle for broadcasting state
+        self.mp_prev_positions = {}   # host-side previous cells for crossing catches
 
         # DBD-specific shared state
         self.mp_generators   = []     # list of Generator
@@ -1515,6 +1532,9 @@ class Game:
                 "ai_state":     "idle",
                 "ai_timer":     0.0,
                 "ai_target_id": None,
+                "ai_target_pos": None,
+                "ai_last_pos":  None,
+                "ai_facing_angle": math.pi / 2,
                 "ai_recent":    [],
             })
             self.mp_move_timers.append(0.0)
@@ -1769,6 +1789,7 @@ class Game:
         self.mp_pending_input[0] = self.mp_local_input
 
         # 3. per-player movement (imprisoned or carried players can't move)
+        self.mp_prev_positions = {p["id"]: (p["r"], p["c"]) for p in self.mp_players}
         for p in self.mp_players:
             if not p["alive"] or p.get("imprisoned") or p.get("carried"):
                 continue
@@ -1892,6 +1913,8 @@ class Game:
     BOT_FLEE_TRIGGER_DIST = 6   # enter FLEE when hunter ≤ this many cells away
     BOT_FLEE_SAFE_DIST    = 12  # only exit FLEE when hunter ≥ this many cells
     BOT_FLEE_COMMIT_SEC   = 4.0 # min seconds to stay in FLEE
+    BOT_FLEE_TARGET_RADIUS = 10 # reachable cells scanned for a safe flee target
+    BOT_RESCUE_DANGER_DIST = 5  # avoid sending bots into a camped freezing pod
     BOT_HUNTER_COMMIT_SEC = 3.0 # hunter sticks with one target this long
 
     def _bot_tick(self, dt):
@@ -1909,7 +1932,9 @@ class Game:
                        if p["role"] == "hunter" and p["alive"]), None)
         hunter_dist = None
         if hunter is not None:
-            hunter_dist = bfs_distances(self.walls, hunter["r"], hunter["c"], self.gates)
+            hunter_dist = bfs_distances(
+                self.walls, hunter["r"], hunter["c"], self.gates, True
+            )
         runner_positions = [(x["id"], x["r"], x["c"]) for x in self.mp_players
                             if x.get("role") == "runner"
                             and x["alive"]
@@ -1930,6 +1955,9 @@ class Game:
             # Decrement state-commitment timer
             p["ai_timer"] = max(0.0, p.get("ai_timer", 0.0) - dt)
             p.setdefault("ai_recent", [])
+            p.setdefault("ai_target_pos", None)
+            p.setdefault("ai_last_pos", None)
+            p.setdefault("ai_facing_angle", math.pi / 2)
 
             if pid not in self.mp_pending_input:
                 self.mp_pending_input[pid] = {"dr": 0, "dc": 0, "e_held": False}
@@ -1940,6 +1968,235 @@ class Game:
                 self._bot_hunter_tick(p, inp)
             else:
                 self._bot_runner_tick(p, hunter, inp, hunter_dist, runner_positions)
+
+    def _set_bot_step(self, p, inp, nr, nc):
+        inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+        if inp["dr"] or inp["dc"]:
+            p["ai_facing_angle"] = math.atan2(inp["dr"], inp["dc"])
+        p["ai_last_pos"] = [p["r"], p["c"]]
+        recent = p.setdefault("ai_recent", [])
+        recent.append([nr, nc])
+        del recent[:-8]
+
+    def _closed_gate_at(self, r, c):
+        gate = gate_at(self.gates, r, c)
+        if gate and not gate.is_open:
+            return gate
+        return None
+
+    def _follow_bot_path(self, p, inp, path):
+        if path is None:
+            return False
+        if not path:
+            return True
+        nr, nc = path[0]
+        gate = self._closed_gate_at(nr, nc)
+        if gate and gate.is_adjacent(p["r"], p["c"]):
+            inp["e_held"] = True
+            inp["dr"], inp["dc"] = 0, 0
+            return True
+        self._set_bot_step(p, inp, nr, nc)
+        return True
+
+    def _bot_can_see_cell(self, observer, r, c):
+        if self.mp_mode != "dbb":
+            return True
+        facing = observer.get("ai_facing_angle", math.pi / 2)
+        visible = compute_dbb_fov(
+            self.walls, observer["r"], observer["c"], facing, True
+        )
+        return (r, c) in visible
+
+    def _bot_can_see(self, observer, target):
+        return self._bot_can_see_cell(observer, target["r"], target["c"])
+
+    def _flee_cell_score(self, p, r, c, path_dist, hunter_dist,
+                         current_hdist, runner_positions):
+        hd = hunter_dist[r][c] if hunter_dist is not None else 999
+        if hd < 0:
+            hd = 999
+
+        open_neighbors = 0
+        for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            if not is_wall_for_path(self.walls, r + dr, c + dc, self.gates, True):
+                open_neighbors += 1
+
+        score = hd * 3 + path_dist * 0.35 + open_neighbors * 1.5
+        if hd <= current_hdist:
+            score -= 10
+        if open_neighbors <= 1:
+            score -= 7
+
+        recent = {tuple(x) for x in p.get("ai_recent", [])}
+        if (r, c) in recent:
+            score -= 6
+        if p.get("ai_last_pos") == [r, c]:
+            score -= 9
+
+        for rid, rr, rc in runner_positions:
+            if rid == p["id"]:
+                continue
+            sep = abs(r - rr) + abs(c - rc)
+            if sep == 0:
+                score -= 14
+            elif sep <= 4:
+                score -= (5 - sep) * 2.5
+
+        score += ((r * 17 + c * 31 + p["id"] * 13) % 7) * 0.01
+        return score
+
+    def _choose_runner_flee_target(self, p, hunter_dist, runner_positions):
+        rows = len(self.walls)
+        cols = len(self.walls[0]) if rows else 0
+        pr, pc = p["r"], p["c"]
+        current_hdist = 999
+        if hunter_dist is not None:
+            current_hdist = hunter_dist[pr][pc]
+            if current_hdist < 0:
+                current_hdist = 999
+
+        q = deque([(pr, pc, 0, None)])
+        visited = {(pr, pc)}
+        best_cell, best_score = None, -10 ** 9
+        last_pos = p.get("ai_last_pos")
+
+        while q:
+            r, c, path_dist, first_step = q.popleft()
+            if path_dist > self.BOT_FLEE_TARGET_RADIUS:
+                continue
+            if path_dist >= 2:
+                score = self._flee_cell_score(
+                    p, r, c, path_dist, hunter_dist,
+                    current_hdist, runner_positions
+                )
+                if first_step and last_pos == [first_step[0], first_step[1]]:
+                    score -= 12
+                if score > best_score:
+                    best_cell, best_score = (r, c), score
+
+            for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+                nr, nc = r + dr, c + dc
+                if (nr, nc) in visited:
+                    continue
+                if 0 <= nr < rows and 0 <= nc < cols \
+                        and not is_wall_for_path(self.walls, nr, nc, self.gates, True):
+                    visited.add((nr, nc))
+                    q.append((nr, nc, path_dist + 1, first_step or (nr, nc)))
+
+        return best_cell
+
+    def _runner_flee_target_is_valid(self, p, hunter_dist):
+        target = p.get("ai_target_pos")
+        if not target or len(target) != 2:
+            return False
+        tr, tc = int(target[0]), int(target[1])
+        if (tr, tc) == (p["r"], p["c"]):
+            return False
+        if is_wall_for_path(self.walls, tr, tc, self.gates, True):
+            return False
+        if hunter_dist is None:
+            return True
+
+        current_hdist = hunter_dist[p["r"]][p["c"]]
+        target_hdist = hunter_dist[tr][tc]
+        if current_hdist < 0:
+            current_hdist = 999
+        if target_hdist < 0:
+            target_hdist = 999
+        return target_hdist >= max(self.BOT_FLEE_TRIGGER_DIST + 1,
+                                   current_hdist - 1)
+
+    def _first_imprisoned_pod(self):
+        for w in self.mp_freezing_pods:
+            if w.imprisoned_pid is not None:
+                return w
+        return None
+
+    def _best_rescue_side_safety(self, pod, hunter_dist):
+        if hunter_dist is None:
+            return 999
+        best = -1
+        for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            nr, nc = pod.r + dr, pod.c + dc
+            if is_wall_for_path(self.walls, nr, nc, self.gates, True):
+                continue
+            d = hunter_dist[nr][nc]
+            if d < 0:
+                d = 999
+            best = max(best, d)
+        return best
+
+    def _rescue_path(self, p, pod, hunter_dist=None, require_safe=False):
+        if pod.is_adjacent(p["r"], p["c"]):
+            return []
+
+        current_hdist = 999
+        if hunter_dist is not None:
+            current_hdist = hunter_dist[p["r"]][p["c"]]
+            if current_hdist < 0:
+                current_hdist = 999
+
+        best_path, best_score = None, -10 ** 9
+        for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            nr, nc = pod.r + dr, pod.c + dc
+            if is_wall_for_path(self.walls, nr, nc, self.gates, True):
+                continue
+
+            path = bfs(self.walls, p["r"], p["c"],
+                       nr, nc, self.gates, True)
+            if path is None:
+                continue
+
+            side_hdist = 999
+            if hunter_dist is not None:
+                side_hdist = hunter_dist[nr][nc]
+                if side_hdist < 0:
+                    side_hdist = 999
+            if require_safe and side_hdist < max(
+                    self.BOT_FLEE_TRIGGER_DIST + 1, current_hdist):
+                continue
+
+            score = side_hdist * 3 - len(path)
+            if path and p.get("ai_last_pos") == [path[0][0], path[0][1]]:
+                score -= 5
+            if score > best_score:
+                best_path, best_score = path, score
+        return best_path
+
+    def _assigned_rescuer_id(self, pod, hunter_dist):
+        pod_safety = self._best_rescue_side_safety(pod, hunter_dist)
+        best_id, best_score = None, 10 ** 9
+        for candidate in self.mp_players:
+            if not candidate.get("is_bot"):
+                continue
+            if candidate.get("role") != "runner" or not candidate["alive"]:
+                continue
+            if candidate.get("imprisoned") or candidate.get("carried"):
+                continue
+
+            path = self._rescue_path(candidate, pod, hunter_dist)
+            if path is None:
+                continue
+
+            already_adjacent = pod.is_adjacent(candidate["r"], candidate["c"])
+            if pod_safety < self.BOT_RESCUE_DANGER_DIST and not already_adjacent:
+                continue
+
+            score = len(path)
+            if already_adjacent:
+                score -= 20
+            if candidate.get("ai_state") == "flee":
+                score += 4
+            if hunter_dist is not None:
+                cd = hunter_dist[candidate["r"]][candidate["c"]]
+                if cd >= 0 and cd <= self.BOT_FLEE_TRIGGER_DIST and not already_adjacent:
+                    score += 6
+                score += max(0, self.BOT_RESCUE_DANGER_DIST - pod_safety) * 3
+
+            if best_id is None or score < best_score \
+                    or (score == best_score and candidate["id"] < best_id):
+                best_id, best_score = candidate["id"], score
+        return best_id
 
     def _bot_hunter_tick(self, p, inp):
         """Hunter bot: BFS-chase the committed target runner.
@@ -1954,15 +2211,16 @@ class Game:
             for w in self.mp_freezing_pods:
                 if w.imprisoned_pid is not None:
                     continue
-                path = bfs_adjacent(self.walls, p["r"], p["c"], w.r, w.c, self.gates)
+                path = bfs_adjacent(
+                    self.walls, p["r"], p["c"], w.r, w.c, self.gates, True
+                )
                 if path is not None and (best_path is None or len(path) < len(best_path)):
                     best_path = path
             p["ai_state"] = "carry"
             p["ai_target_id"] = None
+            p["ai_target_pos"] = None
             p["ai_timer"] = 0.0
-            if best_path:
-                nr, nc = best_path[0]
-                inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+            self._follow_bot_path(p, inp, best_path)
             return
 
         # Resolve current target if commitment is still alive
@@ -1975,31 +2233,48 @@ class Game:
                                and not x.get("carried")), None)
 
         path = None
-        if cur_target is not None:
-            path = bfs(self.walls, p["r"], p["c"],
-                       cur_target["r"], cur_target["c"], self.gates)
+        if cur_target is not None and self._bot_can_see(p, cur_target):
+            p["ai_target_pos"] = [cur_target["r"], cur_target["c"]]
+            path = bfs(
+                self.walls, p["r"], p["c"],
+                cur_target["r"], cur_target["c"], self.gates, True
+            )
+        elif cur_target is not None and self.mp_mode == "dbb" and p.get("ai_target_pos"):
+            tr, tc = p["ai_target_pos"]
+            path = bfs(self.walls, p["r"], p["c"], tr, tc, self.gates, True)
+            if (p["r"], p["c"]) == (tr, tc) or path is None:
+                p["ai_target_id"] = None
+                p["ai_target_pos"] = None
+                cur_target = None
 
         if cur_target is None or path is None:
             candidates = [x for x in self.mp_players
                           if x.get("role") == "runner"
                           and x["alive"]
                           and not x.get("imprisoned")
-                          and not x.get("carried")]
+                          and not x.get("carried")
+                          and self._bot_can_see(p, x)]
             best_target, best_path = None, None
             for x in candidates:
-                candidate_path = bfs(self.walls, p["r"], p["c"], x["r"], x["c"], self.gates)
+                candidate_path = bfs(
+                    self.walls, p["r"], p["c"], x["r"], x["c"], self.gates, True
+                )
                 if candidate_path is not None and (best_path is None or len(candidate_path) < len(best_path)):
                     best_target, best_path = x, candidate_path
             if best_target is None:
                 p["ai_target_id"] = None
+                if self.mp_mode == "dbb" and p.get("ai_timer", 0.0) <= 0:
+                    p["ai_facing_angle"] = (
+                        p.get("ai_facing_angle", math.pi / 2) + math.pi / 4
+                    ) % math.tau
+                    p["ai_timer"] = 0.35
                 return
             cur_target, path = best_target, best_path
             p["ai_target_id"] = cur_target["id"]
+            p["ai_target_pos"] = [cur_target["r"], cur_target["c"]]
             p["ai_timer"]     = self.BOT_HUNTER_COMMIT_SEC
 
-        if path:
-            nr, nc = path[0]
-            inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+        self._follow_bot_path(p, inp, path)
 
     def _bot_runner_tick(self, p, hunter, inp, hunter_dist, runner_positions):
         """Runner bot with FLEE-commit hysteresis.
@@ -2013,77 +2288,123 @@ class Game:
           5. Head for the exit if it's unlocked.
         """
         hdist = 999
-        if hunter and hunter["alive"] and hunter_dist is not None:
+        hunter_seen = bool(hunter and hunter["alive"] and self._bot_can_see(p, hunter))
+        if hunter_seen and hunter_dist is not None:
             hdist = hunter_dist[p["r"]][p["c"]]
             if hdist < 0:
                 hdist = 999
 
         state = p.get("ai_state", "idle")
+        target_pod = self._first_imprisoned_pod()
+        can_rescue_now = bool(
+            target_pod is not None and target_pod.is_adjacent(p["r"], p["c"])
+        )
+        if can_rescue_now:
+            p["ai_state"] = "rescue"
+            p["ai_target_pos"] = [target_pod.r, target_pod.c]
+            inp["e_held"] = True
+            inp["dr"], inp["dc"] = 0, 0
+            return
+
+        assigned_to_rescue = target_pod is not None \
+            and self._assigned_rescuer_id(target_pod, hunter_dist) == p["id"]
+        rescue_under_pressure = hunter_seen \
+            and hdist <= self.BOT_FLEE_TRIGGER_DIST \
+            and not can_rescue_now
+
+        if assigned_to_rescue:
+            rescue_path = self._rescue_path(
+                p, target_pod, hunter_dist, rescue_under_pressure
+            )
+            if rescue_path is None and not rescue_under_pressure:
+                rescue_path = bfs_adjacent(
+                    self.walls, p["r"], p["c"],
+                    target_pod.r, target_pod.c, self.gates, True
+                )
+
+        if assigned_to_rescue and (not rescue_under_pressure or rescue_path is not None):
+            p["ai_state"] = "rescue"
+            p["ai_target_pos"] = [target_pod.r, target_pod.c]
+            if self._follow_bot_path(p, inp, rescue_path):
+                return
 
         # ── 1. FLEE state transitions (hysteresis) ────────────────────────────
         if state != "flee" \
+                and hunter_seen \
                 and hdist <= self.BOT_FLEE_TRIGGER_DIST \
                 and not (hunter and hunter.get("carrying_pid")):
             # Hunter is close and not busy carrying someone — commit to flee.
             p["ai_state"] = "flee"
             p["ai_timer"] = self.BOT_FLEE_COMMIT_SEC
+            p["ai_target_pos"] = None
             state = "flee"
         elif state == "flee" and p["ai_timer"] <= 0:
             if hdist >= self.BOT_FLEE_SAFE_DIST:
                 p["ai_state"] = "idle"
+                p["ai_target_pos"] = None
                 state = "idle"
             else:
                 # Still not safe — refresh the commitment instead of bouncing
                 # back to repair only to immediately re-flee next frame.
                 p["ai_timer"] = self.BOT_FLEE_COMMIT_SEC / 2
+        elif state != "flee":
+            p["ai_target_pos"] = None
 
         # ── 2. Execute FLEE ──────────────────────────────────────────────────
         if state == "flee":
-            if hunter:
-                recent = p.get("ai_recent", [])
+            if hunter_seen or p.get("ai_target_pos"):
+                if not self._runner_flee_target_is_valid(p, hunter_dist):
+                    target = None
+                    if hunter_seen:
+                        target = self._choose_runner_flee_target(
+                            p, hunter_dist, runner_positions
+                        )
+                    p["ai_target_pos"] = [target[0], target[1]] if target else None
+
+                target = p.get("ai_target_pos")
+                path = None
+                if target:
+                    path = bfs(self.walls, p["r"], p["c"],
+                               int(target[0]), int(target[1]), self.gates, True)
+                    last_pos = p.get("ai_last_pos")
+                    if path and last_pos == [path[0][0], path[0][1]]:
+                        target = None
+                        if hunter_seen:
+                            target = self._choose_runner_flee_target(
+                                p, hunter_dist, runner_positions
+                            )
+                        p["ai_target_pos"] = [target[0], target[1]] if target else None
+                        if target:
+                            path = bfs(self.walls, p["r"], p["c"],
+                                       target[0], target[1], self.gates, True)
+                            if path and last_pos == [path[0][0], path[0][1]]:
+                                path = None
+
+                if self._follow_bot_path(p, inp, path):
+                    return
+
                 best_score = -10 ** 9
-                best_dr, best_dc = 0, 0
+                best_cell = None
                 for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
                     nr, nc = p["r"] + dr, p["c"] + dc
-                    if is_wall(self.walls, nr, nc, self.gates):
+                    if is_wall_for_path(self.walls, nr, nc, self.gates, True):
                         continue
-                    if hunter_dist is not None:
-                        d = hunter_dist[nr][nc]
-                        if d < 0:
-                            d = 999
-                    else:
-                        d = abs(nr - hunter["r"]) + abs(nc - hunter["c"])
-                    score = d
-                    if d <= hdist:
-                        score -= 2
-                    if (nr, nc) in recent:
-                        score -= 4
-                    for rid, rr, rc in runner_positions:
-                        if rid == p["id"]:
-                            continue
-                        sep = abs(nr - rr) + abs(nc - rc)
-                        if sep == 0:
-                            score -= 8
-                        elif sep <= 2:
-                            score -= (3 - sep) * 2
-                    score += ((nr * 17 + nc * 31 + p["id"] * 13) % 5) * 0.01
+                    score = self._flee_cell_score(
+                        p, nr, nc, 1, hunter_dist, hdist, runner_positions
+                    )
                     if score > best_score:
                         best_score = score
-                        best_dr, best_dc = dr, dc
-                if best_score > -10 ** 9:
-                    inp["dr"], inp["dc"] = best_dr, best_dc
-                    recent.append((p["r"] + best_dr, p["c"] + best_dc))
-                    del recent[:-6]
+                        best_cell = (nr, nc)
+                if best_cell:
+                    self._follow_bot_path(p, inp, [best_cell])
             return
 
         # ── 3. Help carried teammate (shadow the hunter to ambush a rescue) ───
-        if hunter and hunter.get("carrying_pid") and hdist < 15:
+        if hunter_seen and hunter and hunter.get("carrying_pid") and hdist < 15:
             if hdist > 2:
                 path = bfs(self.walls, p["r"], p["c"],
-                           hunter["r"], hunter["c"], self.gates)
-                if path:
-                    nr, nc = path[0]
-                    inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+                           hunter["r"], hunter["c"], self.gates, True)
+                self._follow_bot_path(p, inp, path)
             for w in self.mp_freezing_pods:
                 if w.imprisoned_pid is not None and w.is_adjacent(p["r"], p["c"]):
                     inp["e_held"] = True
@@ -2091,22 +2412,6 @@ class Game:
             return
 
         # ── 4. Rescue imprisoned teammates ───────────────────────────────────
-        target_pod = None
-        for w in self.mp_freezing_pods:
-            if w.imprisoned_pid is not None:
-                target_pod = w
-                break
-        if target_pod is not None:
-            if target_pod.is_adjacent(p["r"], p["c"]):
-                inp["e_held"] = True
-            else:
-                path = bfs_adjacent(self.walls, p["r"], p["c"],
-                                    target_pod.r, target_pod.c, self.gates)
-                if path:
-                    nr, nc = path[0]
-                    inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
-            return
-
         # ── 5. Repair the closest unfinished generator ───────────────────────
         if not self.exit_unlocked:
             best_gen, best_path = None, None
@@ -2114,7 +2419,7 @@ class Game:
                 if gen.completed:
                     continue
                 path = bfs_adjacent(self.walls, p["r"], p["c"],
-                                    gen.r, gen.c, self.gates)
+                                    gen.r, gen.c, self.gates, True)
                 if path is not None and (best_path is None or len(path) < len(best_path)):
                     best_path = path
                     best_gen  = gen
@@ -2122,13 +2427,12 @@ class Game:
                 if best_gen.is_adjacent(p["r"], p["c"]):
                     inp["e_held"] = True
                 elif best_path:
-                    nr, nc = best_path[0]
-                    inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+                    self._follow_bot_path(p, inp, best_path)
             return
 
         # ── 6. Exit unlocked — head to the exit ──────────────────────────────
         path = bfs(self.walls, p["r"], p["c"],
-                   self.exit_pos[0], self.exit_pos[1], self.gates)
+                   self.exit_pos[0], self.exit_pos[1], self.gates, True)
         if path:
             nr, nc = path[0]
             gate_in_way = next((g for g in self.gates
@@ -2137,7 +2441,7 @@ class Game:
                 if gate_in_way.is_adjacent(p["r"], p["c"]):
                     inp["e_held"] = True
             else:
-                inp["dr"], inp["dc"] = nr - p["r"], nc - p["c"]
+                self._follow_bot_path(p, inp, path)
 
     def _dbd_tick(self, dt):
         """Generators, catches, imprisonment, rescues, win conditions."""
@@ -2148,21 +2452,20 @@ class Game:
             self._end_dbd("hunter")
             return
 
-        # generators: any adjacent runner holding E ticks progress
+        # generators: multiple adjacent runners repair together.
         for gen in self.mp_generators:
             if gen.completed:
                 continue
-            ticking = False
+            repairers = 0
             for p in self.mp_players:
                 if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
                     continue
                 if gen.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
                     if inp.get("e_held"):
-                        ticking = True
-                        break
-            if ticking:
-                gen.progress += dt
+                        repairers += 1
+            if repairers:
+                gen.progress += dt * repairers
                 if gen.progress >= GEN_REPAIR_TIME:
                     gen.progress = GEN_REPAIR_TIME
                     gen.completed = True
@@ -2177,13 +2480,23 @@ class Game:
             if hunter.get("catch_cooldown", 0) > 0:
                 hunter["catch_cooldown"] -= dt
             elif hunter.get("carrying_pid") is None:
+                old_positions = getattr(self, "mp_prev_positions", {})
+                hunter_old = old_positions.get(
+                    hunter["id"], (hunter["r"], hunter["c"])
+                )
                 for p in self.mp_players:
                     if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
                         continue
-                    if (p["r"], p["c"]) == (hunter["r"], hunter["c"]):
+                    runner_old = old_positions.get(p["id"], (p["r"], p["c"]))
+                    same_cell = (p["r"], p["c"]) == (hunter["r"], hunter["c"])
+                    crossed = runner_old == (hunter["r"], hunter["c"]) \
+                        and hunter_old == (p["r"], p["c"])
+                    if same_cell or crossed:
                         hunter["carrying_pid"] = p["id"]
                         p["carried"] = True
                         p["carry_timer"] = HUNTER_CARRY_TIME
+                        p["ai_state"] = "idle"
+                        p["ai_target_pos"] = None
                         break
             else:
                 carried_runner = next((p for p in self.mp_players if p["id"] == hunter["carrying_pid"]), None)
