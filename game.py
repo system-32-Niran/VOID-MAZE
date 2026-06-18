@@ -400,6 +400,13 @@ class Gate:
 
 # ── DBD entities ──────────────────────────────────────────────────────────────
 GEN_REPAIR_TIME    = 10.0   # seconds of held E to finish a generator
+GEN_SKILL_DELAY_MIN = 1.0   # repair seconds before a possible skill check
+GEN_SKILL_DELAY_MAX = 2.2
+GEN_SKILL_DURATION   = 1.8
+GEN_SKILL_ZONE_WIDTH = 0.16
+GEN_SKILL_FAIL_PENALTY = 2.0
+GEN_SKILL_STUN_TIME  = 1.5
+GEN_BOT_SKILL_SUCCESS_RATE = 0.85
 FREEZING_POD_IMPRISON = 30.0   # seconds before an imprisoned runner is eliminated
 DBD_MATCH_LENGTH   = 7 * 60 # 7 minutes
 DBD_GEN_COUNT      = 4
@@ -415,6 +422,17 @@ class Generator:
         self.c = c
         self.progress  = 0.0     # 0 .. GEN_REPAIR_TIME
         self.completed = False
+        self.skill_active = False
+        self.skill_owner_id = None
+        self.skill_elapsed = 0.0
+        self.skill_duration = GEN_SKILL_DURATION
+        self.skill_target_start = 0.65
+        self.skill_target_width = GEN_SKILL_ZONE_WIDTH
+        self.skill_cooldown = random.uniform(
+            GEN_SKILL_DELAY_MIN, GEN_SKILL_DELAY_MAX
+        )
+        self.skill_participants = []
+        self.skill_bot_will_succeed = True
 
     def is_adjacent(self, r, c):
         return abs(r - self.r) + abs(c - self.c) <= 1   # same cell or 4-neighbour
@@ -639,7 +657,11 @@ class Game:
         self.mp_status_msg   = ""     # info/error line shown in lobby screens
         self.mp_move_timers  = [0.0] * network.MAX_PLAYERS   # host-side per-player move cd
         self.mp_pending_input = {}    # host-side: latest input per player id
-        self.mp_local_input   = {"dr": 0, "dc": 0, "e_held": False}  # client-side
+        self.mp_local_input   = {
+            "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+        }  # client-side
+        self.mp_skill_seq      = 0     # increments on each SPACE press
+        self.mp_skill_seen     = {}    # host-side last consumed sequence per pid
         self.mp_send_timer    = 0.0   # client throttle for sending input
         self.mp_broadcast_timer = 0.0 # host throttle for broadcasting state
         self.mp_prev_positions = {}   # host-side previous cells for crossing catches
@@ -1301,6 +1323,11 @@ class Game:
             self.client = None
         self.mp_players      = []
         self.mp_pending_input = {}
+        self.mp_skill_seen    = {}
+        self.mp_skill_seq     = 0
+        self.mp_local_input   = {
+            "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+        }
         self.mp_generators   = []
         self.mp_freezing_pods   = []
         self.mp_winner       = ""
@@ -1315,6 +1342,7 @@ class Game:
         self.new_level()
         self.mp_generators = []
         self.mp_freezing_pods = []
+        self.mp_skill_seen = {}
         self.mp_winner = ""
         self.mp_match_timer = DBD_MATCH_LENGTH
         self.exit_unlocked = False
@@ -1336,9 +1364,11 @@ class Game:
             self.portals = []
             gen_pos, pod_pos = [], []
 
-            hunter_r, hunter_c = nearest_free(self.walls, ROWS // 2, COLS // 2, self.gates)
             runner_spawns = [(1, 1), (1, 3), (3, 1), (3, 3)]
             self.exit_pos = nearest_free(self.walls, ROWS - 2, COLS - 2, self.gates)
+            hunter_r, hunter_c = nearest_free(
+                self.walls, ROWS - 2, COLS - 2, self.gates
+            )
 
             taken = [(hunter_r, hunter_c)]
             for _ in range(DBD_GEN_COUNT):
@@ -1384,6 +1414,7 @@ class Game:
                 "imprisoned": False, "imprison_remaining": 0.0,
                 "carried": False, "carry_timer": 0.0,
                 "carrying_pid": None, "catch_cooldown": 0.0,
+                "stun_remaining": 0.0,
                 # AI state — only used for bots. Each bot commits to its
                 # current "ai_state" until "ai_timer" hits 0 (anti-oscillation).
                 "ai_state":     "idle",
@@ -1412,6 +1443,7 @@ class Game:
         self.new_level()
         self.mp_generators = []
         self.mp_freezing_pods = []
+        self.mp_skill_seen = {}
         self.mp_winner     = ""
         self.mp_match_timer = DBD_MATCH_LENGTH
 
@@ -1454,12 +1486,13 @@ class Game:
                     "imprisoned": False, "imprison_remaining": 0.0,
                     "carried": False, "carry_timer": 0.0,
                     "carrying_pid": None, "catch_cooldown": 0.0,
+                    "stun_remaining": 0.0,
                 })
         else:  # DBD-MAZE
             self.exit_unlocked = False
             # randomly pick which slot is the hunter
             hunter_idx = random.randrange(slots)
-            # spawn hunter at the centre of the maze (NOT at the exit corner)
+            # Spawn hunter at the centre of the maze.
             hunter_r, hunter_c = nearest_free(self.walls,
                                               ROWS // 2, COLS // 2, self.gates)
             runner_seen = 0
@@ -1478,6 +1511,7 @@ class Game:
                     "imprisoned": False, "imprison_remaining": 0.0,
                     "carried": False, "carry_timer": 0.0,
                     "carrying_pid": None, "catch_cooldown": 0.0,
+                    "stun_remaining": 0.0,
                 })
             # place generators + freezing pods on free cells
             taken = [(p["r"], p["c"]) for p in self.mp_players]
@@ -1540,7 +1574,15 @@ class Game:
             "hunter":  hunter_pos,
             "gates":   [g.is_open for g in self.gates],
             "level":   self.level,
-            "gens":    [[g.progress, g.completed] for g in self.mp_generators],
+            "gens":    [
+                [
+                    g.progress, g.completed,
+                    g.skill_active, g.skill_owner_id,
+                    g.skill_elapsed, g.skill_duration,
+                    g.skill_target_start, g.skill_target_width,
+                ]
+                for g in self.mp_generators
+            ],
             "fp":      [w.imprisoned_pid for w in self.mp_freezing_pods],
             "timer":   self.mp_match_timer,
             "exit_unlocked": self.exit_unlocked,
@@ -1564,7 +1606,15 @@ class Game:
         gens = msg.get("gens", [])
         for i, g in enumerate(self.mp_generators):
             if i < len(gens):
-                g.progress, g.completed = gens[i]
+                state = gens[i]
+                g.progress, g.completed = state[:2]
+                if len(state) >= 8:
+                    g.skill_active = bool(state[2])
+                    g.skill_owner_id = state[3]
+                    g.skill_elapsed = float(state[4])
+                    g.skill_duration = float(state[5])
+                    g.skill_target_start = float(state[6])
+                    g.skill_target_width = float(state[7])
         wh = msg.get("fp", [])
         for i, w in enumerate(self.mp_freezing_pods):
             if i < len(wh):
@@ -1591,10 +1641,16 @@ class Game:
         # 2. host's own input as player 0
         self.mp_pending_input[0] = self.mp_local_input
 
-        # 3. per-player movement (imprisoned or carried players can't move)
+        for p in self.mp_players:
+            p["stun_remaining"] = max(
+                0.0, p.get("stun_remaining", 0.0) - dt
+            )
+
+        # 3. per-player movement (disabled while imprisoned, carried, or stunned)
         self.mp_prev_positions = {p["id"]: (p["r"], p["c"]) for p in self.mp_players}
         for p in self.mp_players:
-            if not p["alive"] or p.get("imprisoned") or p.get("carried"):
+            if not p["alive"] or p.get("imprisoned") or p.get("carried") \
+                    or p.get("stun_remaining", 0.0) > 0:
                 continue
             pid = p["id"]
             self.mp_move_timers[pid] += dt
@@ -1642,6 +1698,7 @@ class Game:
             holding = False
             for p in self.mp_players:
                 if p["alive"] and not p.get("imprisoned") and not p.get("carried") \
+                   and p.get("stun_remaining", 0.0) <= 0 \
                    and gate.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
                     if inp.get("e_held"):
@@ -1751,8 +1808,11 @@ class Game:
 
             # Imprisoned / carried bots can't act — clear input so they don't
             # carry a stale dr/dc from earlier frames.
-            if not p["alive"] or p.get("imprisoned") or p.get("carried"):
-                self.mp_pending_input[pid] = {"dr": 0, "dc": 0, "e_held": False}
+            if not p["alive"] or p.get("imprisoned") or p.get("carried") \
+                    or p.get("stun_remaining", 0.0) > 0:
+                self.mp_pending_input[pid] = {
+                    "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+                }
                 continue
 
             # Decrement state-commitment timer
@@ -1762,7 +1822,9 @@ class Game:
             p.setdefault("ai_last_pos", None)
 
             if pid not in self.mp_pending_input:
-                self.mp_pending_input[pid] = {"dr": 0, "dc": 0, "e_held": False}
+                self.mp_pending_input[pid] = {
+                    "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+                }
             inp = self.mp_pending_input[pid]
             inp["dr"], inp["dc"], inp["e_held"] = 0, 0, False
 
@@ -2218,6 +2280,62 @@ class Game:
             else:
                 self._follow_bot_path(p, inp, path)
 
+    def _consume_skill_check_presses(self):
+        pressed = set()
+        for p in self.mp_players:
+            pid = p["id"]
+            inp = self.mp_pending_input.get(pid, {})
+            seq = int(inp.get("skill_seq", 0))
+            if pid not in self.mp_skill_seen:
+                self.mp_skill_seen[pid] = seq
+            elif seq != self.mp_skill_seen[pid]:
+                self.mp_skill_seen[pid] = seq
+                pressed.add(pid)
+        return pressed
+
+    def _start_generator_skill_check(self, gen, repairers):
+        humans = [p for p in repairers if not p.get("is_bot")]
+        owner = random.choice(humans or repairers)
+        gen.skill_active = True
+        gen.skill_owner_id = owner["id"]
+        gen.skill_elapsed = 0.0
+        gen.skill_duration = GEN_SKILL_DURATION
+        gen.skill_target_width = GEN_SKILL_ZONE_WIDTH
+        gen.skill_target_start = random.uniform(
+            0.52, 0.96 - gen.skill_target_width
+        )
+        gen.skill_participants = [p["id"] for p in repairers]
+        gen.skill_bot_will_succeed = (
+            random.random() < GEN_BOT_SKILL_SUCCESS_RATE
+        )
+
+    def _finish_generator_skill_check(self, gen, success):
+        if not success:
+            gen.progress = max(
+                0.0, gen.progress - GEN_SKILL_FAIL_PENALTY
+            )
+            participant_ids = set(gen.skill_participants)
+            for p in self.mp_players:
+                if p["id"] not in participant_ids:
+                    continue
+                if p.get("role") != "runner" or not p["alive"]:
+                    continue
+                p["stun_remaining"] = max(
+                    p.get("stun_remaining", 0.0),
+                    GEN_SKILL_STUN_TIME,
+                )
+                inp = self.mp_pending_input.get(p["id"])
+                if inp is not None:
+                    inp["dr"], inp["dc"], inp["e_held"] = 0, 0, False
+
+        gen.skill_active = False
+        gen.skill_owner_id = None
+        gen.skill_elapsed = 0.0
+        gen.skill_participants = []
+        gen.skill_cooldown = random.uniform(
+            GEN_SKILL_DELAY_MIN, GEN_SKILL_DELAY_MAX
+        )
+
     def _dbd_tick(self, dt):
         """Generators, catches, imprisonment, rescues, win conditions."""
         # match timer
@@ -2227,23 +2345,76 @@ class Game:
             self._end_dbd("hunter")
             return
 
-        # generators: multiple adjacent runners repair together.
+        skill_presses = self._consume_skill_check_presses()
+
+        # Generators: repair speed stacks; one shared skill check can interrupt it.
         for gen in self.mp_generators:
             if gen.completed:
+                gen.skill_active = False
                 continue
-            repairers = 0
+
+            repairers = []
             for p in self.mp_players:
-                if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
+                if p["role"] != "runner" or not p["alive"] \
+                        or p.get("imprisoned") or p.get("carried") \
+                        or p.get("stun_remaining", 0.0) > 0:
                     continue
-                if gen.is_adjacent(p["r"], p["c"]):
-                    inp = self.mp_pending_input.get(p["id"], {})
-                    if inp.get("e_held"):
-                        repairers += 1
+                inp = self.mp_pending_input.get(p["id"], {})
+                if gen.is_adjacent(p["r"], p["c"]) and inp.get("e_held"):
+                    repairers.append(p)
+
+            failed = False
+            if gen.skill_active:
+                current_ids = {p["id"] for p in repairers}
+                gen.skill_participants = sorted(
+                    set(gen.skill_participants) | current_ids
+                )
+                owner = next(
+                    (p for p in self.mp_players
+                     if p["id"] == gen.skill_owner_id),
+                    None,
+                )
+                gen.skill_elapsed += dt
+                needle = min(
+                    1.0, gen.skill_elapsed / max(0.01, gen.skill_duration)
+                )
+                target_end = (
+                    gen.skill_target_start + gen.skill_target_width
+                )
+
+                if owner is None or owner["id"] not in current_ids:
+                    self._finish_generator_skill_check(gen, False)
+                    failed = True
+                elif owner.get("is_bot"):
+                    target_mid = (
+                        gen.skill_target_start + gen.skill_target_width / 2
+                    )
+                    if gen.skill_bot_will_succeed and needle >= target_mid:
+                        self._finish_generator_skill_check(gen, True)
+                    elif needle >= 1.0:
+                        self._finish_generator_skill_check(gen, False)
+                        failed = True
+                elif owner["id"] in skill_presses:
+                    success = gen.skill_target_start <= needle <= target_end
+                    self._finish_generator_skill_check(gen, success)
+                    failed = not success
+                elif needle >= 1.0:
+                    self._finish_generator_skill_check(gen, False)
+                    failed = True
+
+            if failed:
+                continue
+
             if repairers:
-                gen.progress += dt * repairers
+                gen.progress += dt * len(repairers)
                 if gen.progress >= GEN_REPAIR_TIME:
                     gen.progress = GEN_REPAIR_TIME
                     gen.completed = True
+                    gen.skill_active = False
+                elif not gen.skill_active:
+                    gen.skill_cooldown -= dt
+                    if gen.skill_cooldown <= 0:
+                        self._start_generator_skill_check(gen, repairers)
 
         # all gens done → unlock exit
         if not self.exit_unlocked and all(g.completed for g in self.mp_generators):
@@ -2308,6 +2479,8 @@ class Game:
                 continue
             for p in self.mp_players:
                 if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
+                    continue
+                if p.get("stun_remaining", 0.0) > 0:
                     continue
                 if w.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
@@ -2520,12 +2693,98 @@ class Game:
             # own avatar: white outline
             if p["id"] == self.player_id:
                 pygame.draw.circle(self.surf, WHITE, (x, y), radius + 2, 2)
+            if p.get("stun_remaining", 0.0) > 0:
+                pygame.draw.circle(
+                    self.surf, (255, 220, 0), (x, y), radius + 5, 3
+                )
 
         # bot hunter (escape mode only)
         if self.mp_mode == "escape" and self.hunter is not None:
             self.hunter.draw(self.surf)
 
         self.draw_mp_panel()
+        self.draw_skill_check()
+
+    def draw_skill_check(self):
+        if self.mp_mode != "dbd":
+            return
+
+        me = next(
+            (p for p in self.mp_players if p["id"] == self.player_id),
+            None,
+        )
+        if me is None:
+            return
+
+        if me.get("stun_remaining", 0.0) > 0:
+            text = self.font_med.render(
+                f"STUNNED  {me['stun_remaining']:.1f}s",
+                True,
+                (255, 220, 0),
+            )
+            x = PANEL_X // 2 - text.get_width() // 2
+            self.surf.blit(text, (x, 32))
+
+        gen = next(
+            (
+                g for g in self.mp_generators
+                if g.skill_active and g.skill_owner_id == self.player_id
+            ),
+            None,
+        )
+        if gen is None:
+            return
+
+        panel_w = min(640, PANEL_X - 80)
+        panel_h = 120
+        panel_x = PANEL_X // 2 - panel_w // 2
+        panel_y = H - panel_h - 42
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 225))
+        self.surf.blit(panel, (panel_x, panel_y))
+        pygame.draw.rect(
+            self.surf, (255, 220, 0),
+            (panel_x, panel_y, panel_w, panel_h), 2,
+        )
+
+        label = self.font_med.render(
+            "SKILL CHECK  -  PRESS SPACE", True, WHITE
+        )
+        self.surf.blit(
+            label,
+            (panel_x + panel_w // 2 - label.get_width() // 2, panel_y + 12),
+        )
+
+        bar_x = panel_x + 38
+        bar_y = panel_y + 72
+        bar_w = panel_w - 76
+        bar_h = 22
+        pygame.draw.rect(
+            self.surf, (45, 45, 55),
+            (bar_x, bar_y, bar_w, bar_h),
+        )
+
+        target_x = bar_x + int(bar_w * gen.skill_target_start)
+        target_w = max(4, int(bar_w * gen.skill_target_width))
+        pygame.draw.rect(
+            self.surf, (80, 220, 100),
+            (target_x, bar_y, target_w, bar_h),
+        )
+
+        needle = min(
+            1.0, gen.skill_elapsed / max(0.01, gen.skill_duration)
+        )
+        needle_x = bar_x + int(bar_w * needle)
+        pygame.draw.line(
+            self.surf, WHITE,
+            (needle_x, bar_y - 8),
+            (needle_x, bar_y + bar_h + 8),
+            4,
+        )
+        pygame.draw.rect(
+            self.surf, WHITE,
+            (bar_x, bar_y, bar_w, bar_h), 2,
+        )
 
     def draw_mp_panel(self):
         pygame.draw.rect(self.surf, PANEL_BG, (PANEL_X, 0, PANEL_W, H))
@@ -2582,6 +2841,8 @@ class Game:
                 status = f"IMPRISONED {p['imprison_remaining']:.0f}s"
             elif p.get("carried"):
                 status = f"CARRIED {p['carry_timer']:.1f}s"
+            elif p.get("stun_remaining", 0.0) > 0:
+                status = f"STUNNED {p['stun_remaining']:.1f}s"
             else:
                 status = "ALIVE"
             text = self.font_sm.render(f"{label}  -  {status}", True, color)
@@ -2599,6 +2860,7 @@ class Game:
             hints = [
                 "WASD / ARROWS : MOVE",
                 "HOLD E : repair / rescue / gate",
+                "SPACE : skill check",
                 "ESC : leave match",
             ]
         for i, hint in enumerate(hints):
@@ -2732,6 +2994,9 @@ class Game:
                             self.state = "menu"
                         else:
                             self.state = "menu"
+
+                    elif self.state == "mp_play" and event.key == pygame.K_SPACE:
+                        self.mp_skill_seq += 1
 
                     elif self.state == "menu":
                         if event.key in (pygame.K_UP, pygame.K_w):
@@ -2948,6 +3213,7 @@ class Game:
                     dr, dc = 0, 0
                 self.mp_local_input = {
                     "dr": dr, "dc": dc, "e_held": pressed[pygame.K_e],
+                    "skill_seq": self.mp_skill_seq,
                 }
 
                 if self.server is not None:
