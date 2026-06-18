@@ -411,7 +411,40 @@ FREEZING_POD_IMPRISON = 30.0   # seconds before an imprisoned runner is eliminat
 DBD_MATCH_LENGTH   = 7 * 60 # 7 minutes
 DBD_GEN_COUNT      = 4
 DBD_FREEZING_POD_COUNT = 5
-HUNTER_CARRY_TIME   = 10.0   # seconds the hunter can carry a runner before they escape
+HUNTER_SLASH_RANGE  = 1.45
+HUNTER_SLASH_COOLDOWN = 0.75
+RUNNER_DOWNED_TIME  = 8.0
+TRAP_CHECK_COUNT    = 3
+TRAP_CHECK_DURATION = 1.5
+TRAP_CHECK_WIDTH    = 0.18
+TRAP_COOLDOWN       = 5.0
+SKILL_SPEED_TIME    = 6.0
+SKILL_INVISIBLE_TIME = 5.0
+SKILL_PHASE_TIME    = 2.0
+SKILL_BLIND_TIME    = 3.5
+SKILL_ORB_SPAWN_MIN = 6.0
+SKILL_ORB_SPAWN_MAX = 10.0
+SKILL_ORB_MAX       = 6
+SKILL_ORB_INITIAL   = 3
+SKILL_NAMES = {
+    "speed": "SPRINT",
+    "invisible": "INVIS",
+    "phase": "PHASE",
+    "spear": "SPEAR",
+    "flash": "FLASH",
+    "teleport": "PEARL",
+    "trap": "TRAP",
+}
+SKILL_COLORS = {
+    "speed": (80, 220, 120),
+    "invisible": (120, 220, 255),
+    "phase": (190, 100, 255),
+    "spear": (255, 90, 70),
+    "flash": (255, 235, 80),
+    "teleport": (80, 220, 210),
+    "trap": (255, 130, 40),
+}
+RANDOM_SKILLS = ("speed", "invisible", "phase", "spear", "flash", "teleport")
 
 
 class Generator:
@@ -658,10 +691,19 @@ class Game:
         self.mp_move_timers  = [0.0] * network.MAX_PLAYERS   # host-side per-player move cd
         self.mp_pending_input = {}    # host-side: latest input per player id
         self.mp_local_input   = {
-            "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+            "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0,
+            "attack_seq": 0, "interact_seq": 0, "use_seq": 0,
+            "selected_skill": 0, "aim_r": 0.0, "aim_c": 0.0,
         }  # client-side
         self.mp_skill_seq      = 0     # increments on each SPACE press
         self.mp_skill_seen     = {}    # host-side last consumed sequence per pid
+        self.mp_attack_seq     = 0
+        self.mp_interact_seq   = 0
+        self.mp_use_seq        = 0
+        self.mp_selected_skill = 0
+        self.mp_attack_seen    = {}
+        self.mp_interact_seen  = {}
+        self.mp_use_seen       = {}
         self.mp_send_timer    = 0.0   # client throttle for sending input
         self.mp_broadcast_timer = 0.0 # host throttle for broadcasting state
         self.mp_prev_positions = {}   # host-side previous cells for crossing catches
@@ -669,6 +711,10 @@ class Game:
         # DBD-specific shared state
         self.mp_generators   = []     # list of Generator
         self.mp_freezing_pods   = []     # list of FreezingPod
+        self.mp_projectiles  = []
+        self.mp_skill_orbs   = []
+        self.mp_traps        = []
+        self.mp_orb_timer    = 0.0
         self.mp_match_timer  = 0.0    # countdown seconds remaining in DBD match
         self.exit_unlocked   = True   # escape: always True; DBD: False until all gens done
 
@@ -1324,12 +1370,25 @@ class Game:
         self.mp_players      = []
         self.mp_pending_input = {}
         self.mp_skill_seen    = {}
+        self.mp_attack_seen   = {}
+        self.mp_interact_seen = {}
+        self.mp_use_seen      = {}
         self.mp_skill_seq     = 0
+        self.mp_attack_seq    = 0
+        self.mp_interact_seq  = 0
+        self.mp_use_seq       = 0
+        self.mp_selected_skill = 0
         self.mp_local_input   = {
-            "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+            "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0,
+            "attack_seq": 0, "interact_seq": 0, "use_seq": 0,
+            "selected_skill": 0, "aim_r": 0.0, "aim_c": 0.0,
         }
         self.mp_generators   = []
         self.mp_freezing_pods   = []
+        self.mp_projectiles = []
+        self.mp_skill_orbs = []
+        self.mp_traps = []
+        self.mp_orb_timer = 0.0
         self.mp_winner       = ""
         self.exit_unlocked   = True
         self.player_id        = 0
@@ -1337,12 +1396,84 @@ class Game:
 
     # ── host: start a multiplayer match ───────────────────────────────────────
 
+    def _initialize_dbd_player(self, p):
+        random_skill = random.choice(RANDOM_SKILLS)
+        p.update({
+            "downed": False,
+            "downed_remaining": 0.0,
+            "stun_remaining": 0.0,
+            "speed_remaining": 0.0,
+            "invisible_remaining": 0.0,
+            "phase_remaining": 0.0,
+            "blind_remaining": 0.0,
+            "attack_cooldown": 0.0,
+            "attack_anim": 0.0,
+            "trap_cooldown": 0.0,
+            "trapped": False,
+            "trap_checks_remaining": 0,
+            "trap_check_elapsed": 0.0,
+            "trap_check_target": 0.6,
+            "trap_check_width": TRAP_CHECK_WIDTH,
+            "facing_r": 0.0,
+            "facing_c": 1.0,
+            "selected_skill": 0,
+            "skills": (
+                ["trap", random_skill]
+                if p.get("role") == "hunter"
+                else [random_skill]
+            ),
+        })
+
+    def _reset_local_action_sequences(self):
+        self.mp_skill_seq = 0
+        self.mp_attack_seq = 0
+        self.mp_interact_seq = 0
+        self.mp_use_seq = 0
+        self.mp_selected_skill = 0
+        self.mp_local_input.update({
+            "skill_seq": 0,
+            "attack_seq": 0,
+            "interact_seq": 0,
+            "use_seq": 0,
+            "selected_skill": 0,
+        })
+
+    def _reset_dbd_action_state(self):
+        self.mp_skill_seen = {}
+        self.mp_attack_seen = {}
+        self.mp_interact_seen = {}
+        self.mp_use_seen = {}
+        self._reset_local_action_sequences()
+        self.mp_projectiles = []
+        self.mp_skill_orbs = []
+        self.mp_traps = []
+        self.mp_orb_timer = random.uniform(
+            SKILL_ORB_SPAWN_MIN, SKILL_ORB_SPAWN_MAX
+        )
+
+    def _spawn_skill_orb(self):
+        taken = {
+            (p["r"], p["c"]) for p in self.mp_players if p["alive"]
+        }
+        taken.update((g.r, g.c) for g in self.mp_generators)
+        taken.update((w.r, w.c) for w in self.mp_freezing_pods)
+        taken.update((int(o["r"]), int(o["c"])) for o in self.mp_skill_orbs)
+        taken.update((int(t["r"]), int(t["c"])) for t in self.mp_traps)
+        taken.add(tuple(self.exit_pos))
+        cell = free_cell(self.walls, taken)
+        if cell is not None:
+            self.mp_skill_orbs.append({"r": cell[0], "c": cell[1]})
+
+    def _seed_skill_orbs(self):
+        for _ in range(SKILL_ORB_INITIAL):
+            self._spawn_skill_orb()
+
     def host_start_dbd_match(self):
         self.server.prune_dead()
         self.new_level()
         self.mp_generators = []
         self.mp_freezing_pods = []
-        self.mp_skill_seen = {}
+        self._reset_dbd_action_state()
         self.mp_winner = ""
         self.mp_match_timer = DBD_MATCH_LENGTH
         self.exit_unlocked = False
@@ -1412,8 +1543,7 @@ class Game:
                 "id": i, "r": r, "c": c, "alive": True,
                 "role": role, "is_bot": is_bot,
                 "imprisoned": False, "imprison_remaining": 0.0,
-                "carried": False, "carry_timer": 0.0,
-                "carrying_pid": None, "catch_cooldown": 0.0,
+                "carried": False, "carrying_pid": None,
                 "stun_remaining": 0.0,
                 # AI state — only used for bots. Each bot commits to its
                 # current "ai_state" until "ai_timer" hits 0 (anti-oscillation).
@@ -1424,12 +1554,14 @@ class Game:
                 "ai_last_pos":  None,
                 "ai_recent":    [],
             })
+            self._initialize_dbd_player(self.mp_players[-1])
             self.mp_move_timers.append(0.0)
 
         for cell in gen_pos:
             self.mp_generators.append(Generator(cell[0], cell[1]))
         for cell in pod_pos:
             self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
+        self._seed_skill_orbs()
             
         self.state = "mp_play"
         self.server.broadcast({"type": "start", **self._serialize_state()})
@@ -1443,7 +1575,7 @@ class Game:
         self.new_level()
         self.mp_generators = []
         self.mp_freezing_pods = []
-        self.mp_skill_seen = {}
+        self._reset_dbd_action_state()
         self.mp_winner     = ""
         self.mp_match_timer = DBD_MATCH_LENGTH
 
@@ -1484,8 +1616,7 @@ class Game:
                     "id": i, "r": r, "c": c, "alive": True,
                     "role": role,
                     "imprisoned": False, "imprison_remaining": 0.0,
-                    "carried": False, "carry_timer": 0.0,
-                    "carrying_pid": None, "catch_cooldown": 0.0,
+                    "carried": False, "carrying_pid": None,
                     "stun_remaining": 0.0,
                 })
         else:  # DBD-MAZE
@@ -1509,10 +1640,10 @@ class Game:
                     "id": i, "r": r, "c": c, "alive": True,
                     "role": role,
                     "imprisoned": False, "imprison_remaining": 0.0,
-                    "carried": False, "carry_timer": 0.0,
-                    "carrying_pid": None, "catch_cooldown": 0.0,
+                    "carried": False, "carrying_pid": None,
                     "stun_remaining": 0.0,
                 })
+                self._initialize_dbd_player(self.mp_players[-1])
             # place generators + freezing pods on free cells
             taken = [(p["r"], p["c"]) for p in self.mp_players]
             for _ in range(DBD_GEN_COUNT):
@@ -1525,6 +1656,7 @@ class Game:
                 if cell is None: break
                 taken.append(cell)
                 self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
+            self._seed_skill_orbs()
             # DBD-MAZE: no portals
             self.portals = []
 
@@ -1584,6 +1716,9 @@ class Game:
                 for g in self.mp_generators
             ],
             "fp":      [w.imprisoned_pid for w in self.mp_freezing_pods],
+            "projectiles": self.mp_projectiles,
+            "skill_orbs": self.mp_skill_orbs,
+            "traps": self.mp_traps,
             "timer":   self.mp_match_timer,
             "exit_unlocked": self.exit_unlocked,
         }
@@ -1619,6 +1754,9 @@ class Game:
         for i, w in enumerate(self.mp_freezing_pods):
             if i < len(wh):
                 w.imprisoned_pid = wh[i]
+        self.mp_projectiles = msg.get("projectiles", [])
+        self.mp_skill_orbs = msg.get("skill_orbs", [])
+        self.mp_traps = msg.get("traps", [])
         self.mp_match_timer = msg.get("timer", self.mp_match_timer)
         self.exit_unlocked  = msg.get("exit_unlocked", True)
 
@@ -1642,23 +1780,64 @@ class Game:
         self.mp_pending_input[0] = self.mp_local_input
 
         for p in self.mp_players:
-            p["stun_remaining"] = max(
-                0.0, p.get("stun_remaining", 0.0) - dt
-            )
+            previous_phase = p.get("phase_remaining", 0.0)
+            for key in (
+                "stun_remaining", "speed_remaining",
+                "invisible_remaining", "phase_remaining",
+                "blind_remaining", "attack_cooldown",
+                "attack_anim", "trap_cooldown",
+            ):
+                p[key] = max(0.0, p.get(key, 0.0) - dt)
 
-        # 3. per-player movement (disabled while imprisoned, carried, or stunned)
+            if p.get("downed") and not p.get("carried") \
+                    and not p.get("imprisoned"):
+                p["downed_remaining"] = max(
+                    0.0, p.get("downed_remaining", 0.0) - dt
+                )
+                if p["downed_remaining"] <= 0:
+                    p["downed"] = False
+
+            if previous_phase > 0 and p.get("phase_remaining", 0.0) <= 0 \
+                    and is_wall(self.walls, p["r"], p["c"], self.gates):
+                p["r"], p["c"] = nearest_free(
+                    self.walls, p["r"], p["c"], self.gates
+                )
+
+        # 3. per-player movement
         self.mp_prev_positions = {p["id"]: (p["r"], p["c"]) for p in self.mp_players}
         for p in self.mp_players:
-            if not p["alive"] or p.get("imprisoned") or p.get("carried") \
-                    or p.get("stun_remaining", 0.0) > 0:
-                continue
             pid = p["id"]
+            inp = self.mp_pending_input.get(
+                pid, {"dr": 0, "dc": 0, "e_held": False}
+            )
+            p["selected_skill"] = max(
+                0, min(
+                    int(inp.get("selected_skill", p.get("selected_skill", 0))),
+                    max(0, len(p.get("skills", [])) - 1),
+                )
+            )
+            aim_dr = float(inp.get("aim_r", p["r"])) - p["r"]
+            aim_dc = float(inp.get("aim_c", p["c"] + 1)) - p["c"]
+            aim_len = math.hypot(aim_dr, aim_dc)
+            if aim_len > 0.001:
+                p["facing_r"] = aim_dr / aim_len
+                p["facing_c"] = aim_dc / aim_len
+            if not p["alive"] or p.get("imprisoned") or p.get("carried") \
+                    or p.get("stun_remaining", 0.0) > 0 \
+                    or p.get("downed") or p.get("trapped"):
+                continue
             self.mp_move_timers[pid] += dt
-            inp = self.mp_pending_input.get(pid, {"dr": 0, "dc": 0, "e_held": False})
             dr, dc = int(inp.get("dr", 0)), int(inp.get("dc", 0))
-            if (dr or dc) and self.mp_move_timers[pid] >= MOVE_DELAY:
+            move_delay = MOVE_DELAY * (
+                0.5 if p.get("speed_remaining", 0.0) > 0 else 1.0
+            )
+            if (dr or dc) and self.mp_move_timers[pid] >= move_delay:
                 nr, nc = p["r"] + dr, p["c"] + dc
-                if not is_wall(self.walls, nr, nc, self.gates):
+                rows = len(self.walls)
+                cols = len(self.walls[0]) if rows else 0
+                phase_move = p.get("phase_remaining", 0.0) > 0 \
+                    and 0 <= nr < rows and 0 <= nc < cols
+                if phase_move or not is_wall(self.walls, nr, nc, self.gates):
                     p["r"], p["c"] = nr, nc
                     self.mp_move_timers[pid] = 0.0
                     # portal teleport (escape mode only — DBD has no portals)
@@ -1699,6 +1878,7 @@ class Game:
             for p in self.mp_players:
                 if p["alive"] and not p.get("imprisoned") and not p.get("carried") \
                    and p.get("stun_remaining", 0.0) <= 0 \
+                   and not p.get("downed") and not p.get("trapped") \
                    and gate.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
                     if inp.get("e_held"):
@@ -1777,6 +1957,58 @@ class Game:
     BOT_RESCUE_DANGER_DIST = 5  # avoid sending bots into a camped freezing pod
     BOT_HUNTER_COMMIT_SEC = 3.0 # hunter sticks with one target this long
 
+    def _bot_maybe_use_skill(self, p, hunter):
+        skills = p.get("skills", [])
+        if not skills:
+            return
+
+        target = None
+        if p.get("role") == "hunter":
+            candidates = [
+                x for x in self.mp_players
+                if x.get("role") == "runner"
+                and x["alive"]
+                and not x.get("downed")
+                and not x.get("carried")
+                and not x.get("imprisoned")
+                and x.get("invisible_remaining", 0.0) <= 0
+            ]
+            if candidates:
+                target = min(
+                    candidates,
+                    key=lambda x: abs(x["r"] - p["r"])
+                    + abs(x["c"] - p["c"]),
+                )
+        elif hunter and hunter["alive"] \
+                and hunter.get("invisible_remaining", 0.0) <= 0:
+            target = hunter
+
+        if target is None:
+            return
+        distance = math.hypot(
+            target["r"] - p["r"], target["c"] - p["c"]
+        )
+        preferred = None
+        if p.get("role") == "hunter" and "trap" in skills \
+                and distance <= 2.0 and p.get("trap_cooldown", 0.0) <= 0:
+            preferred = "trap"
+        elif distance <= 7.0:
+            for skill in ("spear", "flash", "speed", "invisible", "phase", "teleport"):
+                if skill in skills:
+                    preferred = skill
+                    break
+        if preferred is None:
+            return
+
+        p["selected_skill"] = skills.index(preferred)
+        dr = target["r"] - p["r"]
+        dc = target["c"] - p["c"]
+        length = max(0.001, math.hypot(dr, dc))
+        p["facing_r"], p["facing_c"] = dr / length, dc / length
+        inp = self.mp_pending_input.setdefault(p["id"], {})
+        inp["selected_skill"] = p["selected_skill"]
+        inp["use_seq"] = int(inp.get("use_seq", 0)) + 1
+
     def _bot_tick(self, dt):
         """Generate inputs for all bot players (runners and hunter).
 
@@ -1809,9 +2041,18 @@ class Game:
             # Imprisoned / carried bots can't act — clear input so they don't
             # carry a stale dr/dc from earlier frames.
             if not p["alive"] or p.get("imprisoned") or p.get("carried") \
-                    or p.get("stun_remaining", 0.0) > 0:
+                    or p.get("stun_remaining", 0.0) > 0 \
+                    or p.get("downed") or p.get("trapped"):
+                previous = self.mp_pending_input.get(pid, {})
                 self.mp_pending_input[pid] = {
-                    "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+                    "dr": 0, "dc": 0, "e_held": False,
+                    "skill_seq": int(previous.get("skill_seq", 0)),
+                    "attack_seq": int(previous.get("attack_seq", 0)),
+                    "interact_seq": int(previous.get("interact_seq", 0)),
+                    "use_seq": int(previous.get("use_seq", 0)),
+                    "selected_skill": p.get("selected_skill", 0),
+                    "aim_r": p["r"] + p.get("facing_r", 0.0),
+                    "aim_c": p["c"] + p.get("facing_c", 1.0),
                 }
                 continue
 
@@ -1823,11 +2064,14 @@ class Game:
 
             if pid not in self.mp_pending_input:
                 self.mp_pending_input[pid] = {
-                    "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0
+                    "dr": 0, "dc": 0, "e_held": False, "skill_seq": 0,
+                    "attack_seq": 0, "interact_seq": 0, "use_seq": 0,
+                    "selected_skill": p.get("selected_skill", 0),
                 }
             inp = self.mp_pending_input[pid]
             inp["dr"], inp["dc"], inp["e_held"] = 0, 0, False
 
+            self._bot_maybe_use_skill(p, hunter)
             if p["role"] == "hunter":
                 self._bot_hunter_tick(p, inp)
             else:
@@ -2073,6 +2317,32 @@ class Game:
             self._follow_bot_path(p, inp, best_path)
             return
 
+        downed = [
+            x for x in self.mp_players
+            if x.get("role") == "runner"
+            and x["alive"]
+            and x.get("downed")
+            and not x.get("carried")
+            and not x.get("imprisoned")
+        ]
+        best_downed, best_path = None, None
+        for runner in downed:
+            path = bfs_adjacent(
+                self.walls, p["r"], p["c"],
+                runner["r"], runner["c"], self.gates, True
+            )
+            if path is not None and (
+                    best_path is None or len(path) < len(best_path)):
+                best_downed, best_path = runner, path
+        if best_downed is not None:
+            if best_downed["r"] == p["r"] and best_downed["c"] == p["c"] \
+                    or abs(best_downed["r"] - p["r"]) \
+                    + abs(best_downed["c"] - p["c"]) <= 1:
+                inp["interact_seq"] = int(inp.get("interact_seq", 0)) + 1
+            else:
+                self._follow_bot_path(p, inp, best_path)
+            return
+
         # Resolve current target if commitment is still alive
         cur_target = None
         if p.get("ai_target_id") is not None and p.get("ai_timer", 0.0) > 0:
@@ -2080,7 +2350,9 @@ class Game:
                                if x["id"] == p["ai_target_id"]
                                and x["alive"]
                                and not x.get("imprisoned")
-                               and not x.get("carried")), None)
+                               and not x.get("carried")
+                               and not x.get("downed")
+                               and x.get("invisible_remaining", 0.0) <= 0), None)
 
         path = None
         if cur_target is not None:
@@ -2095,7 +2367,9 @@ class Game:
                           if x.get("role") == "runner"
                           and x["alive"]
                           and not x.get("imprisoned")
-                          and not x.get("carried")]
+                          and not x.get("carried")
+                          and not x.get("downed")
+                          and x.get("invisible_remaining", 0.0) <= 0]
             best_target, best_path = None, None
             for x in candidates:
                 candidate_path = bfs(
@@ -2111,6 +2385,13 @@ class Game:
             p["ai_target_pos"] = [cur_target["r"], cur_target["c"]]
             p["ai_timer"]     = self.BOT_HUNTER_COMMIT_SEC
 
+        dr = cur_target["r"] - p["r"]
+        dc = cur_target["c"] - p["c"]
+        if math.hypot(dr, dc) <= HUNTER_SLASH_RANGE:
+            length = max(0.001, math.hypot(dr, dc))
+            p["facing_r"], p["facing_c"] = dr / length, dc / length
+            inp["attack_seq"] = int(inp.get("attack_seq", 0)) + 1
+            return
         self._follow_bot_path(p, inp, path)
 
     def _bot_runner_tick(self, p, hunter, inp, hunter_dist, runner_positions):
@@ -2125,7 +2406,10 @@ class Game:
           5. Head for the exit if it's unlocked.
         """
         hdist = 999
-        hunter_seen = bool(hunter and hunter["alive"])
+        hunter_seen = bool(
+            hunter and hunter["alive"]
+            and hunter.get("invisible_remaining", 0.0) <= 0
+        )
         if hunter_seen and hunter_dist is not None:
             hdist = hunter_dist[p["r"]][p["c"]]
             if hdist < 0:
@@ -2280,18 +2564,20 @@ class Game:
             else:
                 self._follow_bot_path(p, inp, path)
 
-    def _consume_skill_check_presses(self):
+    def _consume_input_sequence(self, key, seen):
         pressed = set()
         for p in self.mp_players:
             pid = p["id"]
             inp = self.mp_pending_input.get(pid, {})
-            seq = int(inp.get("skill_seq", 0))
-            if pid not in self.mp_skill_seen:
-                self.mp_skill_seen[pid] = seq
-            elif seq != self.mp_skill_seen[pid]:
-                self.mp_skill_seen[pid] = seq
+            seq = int(inp.get(key, 0))
+            previous = seen.get(pid, 0)
+            if seq != previous:
+                seen[pid] = seq
                 pressed.add(pid)
         return pressed
+
+    def _consume_skill_check_presses(self):
+        return self._consume_input_sequence("skill_seq", self.mp_skill_seen)
 
     def _start_generator_skill_check(self, gen, repairers):
         humans = [p for p in repairers if not p.get("is_bot")]
@@ -2336,6 +2622,398 @@ class Game:
             GEN_SKILL_DELAY_MIN, GEN_SKILL_DELAY_MAX
         )
 
+    def _drop_carried_runner(self, hunter):
+        carried = next(
+            (
+                p for p in self.mp_players
+                if p["id"] == hunter.get("carrying_pid")
+            ),
+            None,
+        )
+        hunter["carrying_pid"] = None
+        if carried is None:
+            return
+
+        carried["carried"] = False
+        carried["downed"] = True
+        carried["downed_remaining"] = max(
+            3.0, carried.get("downed_remaining", 0.0)
+        )
+        directions = [
+            (
+                int(round(hunter.get("facing_r", 0.0))),
+                int(round(hunter.get("facing_c", 1.0))),
+            ),
+            (0, 1), (1, 0), (0, -1), (-1, 0),
+        ]
+        for dr, dc in directions:
+            nr, nc = hunter["r"] + dr, hunter["c"] + dc
+            if not is_wall(self.walls, nr, nc, self.gates):
+                carried["r"], carried["c"] = nr, nc
+                return
+        carried["r"], carried["c"] = hunter["r"], hunter["c"]
+
+    def _handle_hunter_interact(self, hunter):
+        if not hunter["alive"] or hunter.get("stun_remaining", 0.0) > 0:
+            return
+        if hunter.get("carrying_pid") is not None:
+            self._drop_carried_runner(hunter)
+            return
+
+        candidates = [
+            p for p in self.mp_players
+            if p.get("role") == "runner"
+            and p["alive"]
+            and p.get("downed")
+            and not p.get("carried")
+            and not p.get("imprisoned")
+            and abs(p["r"] - hunter["r"]) + abs(p["c"] - hunter["c"]) <= 1
+        ]
+        if not candidates:
+            return
+        runner = min(
+            candidates,
+            key=lambda p: abs(p["r"] - hunter["r"])
+            + abs(p["c"] - hunter["c"]),
+        )
+        runner["carried"] = True
+        runner["downed"] = False
+        runner["r"], runner["c"] = hunter["r"], hunter["c"]
+        hunter["carrying_pid"] = runner["id"]
+
+    def _handle_hunter_attack(self, hunter):
+        if not hunter["alive"] or hunter.get("stun_remaining", 0.0) > 0:
+            return
+        if hunter.get("carrying_pid") is not None:
+            return
+        if hunter.get("attack_cooldown", 0.0) > 0:
+            return
+
+        hunter["attack_cooldown"] = HUNTER_SLASH_COOLDOWN
+        hunter["attack_anim"] = 0.25
+        facing_r = hunter.get("facing_r", 0.0)
+        facing_c = hunter.get("facing_c", 1.0)
+        candidates = []
+        for runner in self.mp_players:
+            if runner.get("role") != "runner" or not runner["alive"]:
+                continue
+            if runner.get("downed") or runner.get("carried") \
+                    or runner.get("imprisoned"):
+                continue
+            dr = runner["r"] - hunter["r"]
+            dc = runner["c"] - hunter["c"]
+            dist = math.hypot(dr, dc)
+            if dist > HUNTER_SLASH_RANGE:
+                continue
+            if dist > 0.01:
+                dot = (dr * facing_r + dc * facing_c) / dist
+                if dot < 0.15:
+                    continue
+            candidates.append((dist, runner))
+
+        if not candidates:
+            return
+        runner = min(candidates, key=lambda item: item[0])[1]
+        runner["downed"] = True
+        runner["downed_remaining"] = RUNNER_DOWNED_TIME
+        runner["stun_remaining"] = 0.0
+        runner["trapped"] = False
+        runner["trap_checks_remaining"] = 0
+        runner["ai_state"] = "idle"
+        runner["ai_target_pos"] = None
+
+    def _consume_player_skill(self, p, index):
+        skills = p.get("skills", [])
+        if not (0 <= index < len(skills)):
+            return
+        if skills[index] != "trap":
+            skills.pop(index)
+        p["selected_skill"] = min(
+            p.get("selected_skill", 0), max(0, len(skills) - 1)
+        )
+
+    def _launch_projectile(self, p, kind, speed, max_range):
+        facing_r = p.get("facing_r", 0.0)
+        facing_c = p.get("facing_c", 1.0)
+        length = math.hypot(facing_r, facing_c)
+        if length <= 0.001:
+            facing_r, facing_c = 0.0, 1.0
+        else:
+            facing_r /= length
+            facing_c /= length
+        self.mp_projectiles.append({
+            "kind": kind,
+            "owner_id": p["id"],
+            "r": float(p["r"]),
+            "c": float(p["c"]),
+            "vr": facing_r * speed,
+            "vc": facing_c * speed,
+            "traveled": 0.0,
+            "max_range": float(max_range),
+        })
+
+    def _activate_selected_skill(self, p):
+        if not p["alive"] or p.get("stun_remaining", 0.0) > 0 \
+                or p.get("downed") or p.get("trapped") \
+                or p.get("imprisoned") or p.get("carried"):
+            return
+        skills = p.get("skills", [])
+        if not skills:
+            return
+        index = max(
+            0, min(p.get("selected_skill", 0), len(skills) - 1)
+        )
+        skill = skills[index]
+
+        if skill == "trap":
+            if p.get("role") != "hunter" \
+                    or p.get("trap_cooldown", 0.0) > 0:
+                return
+            cell = (p["r"], p["c"])
+            if any((t["r"], t["c"]) == cell for t in self.mp_traps):
+                return
+            self.mp_traps.append({
+                "r": cell[0], "c": cell[1], "owner_id": p["id"]
+            })
+            p["trap_cooldown"] = TRAP_COOLDOWN
+            return
+
+        if skill == "speed":
+            p["speed_remaining"] = SKILL_SPEED_TIME
+        elif skill == "invisible":
+            p["invisible_remaining"] = SKILL_INVISIBLE_TIME
+        elif skill == "phase":
+            p["phase_remaining"] = SKILL_PHASE_TIME
+        elif skill == "spear":
+            rows = len(self.walls)
+            cols = len(self.walls[0]) if rows else 0
+            self._launch_projectile(
+                p, "spear", 16.0, math.hypot(rows, cols)
+            )
+        elif skill == "flash":
+            self._launch_projectile(p, "flash", 7.0, 12.0)
+        elif skill == "teleport":
+            self._launch_projectile(p, "teleport", 5.0, 14.0)
+        else:
+            return
+        self._consume_player_skill(p, index)
+
+    @staticmethod
+    def _players_are_opponents(a, b):
+        return a.get("role") != b.get("role")
+
+    def _explode_flash(self, projectile):
+        owner = next(
+            (
+                p for p in self.mp_players
+                if p["id"] == projectile["owner_id"]
+            ),
+            None,
+        )
+        if owner is None:
+            return
+        for target in self.mp_players:
+            if not target["alive"] or not self._players_are_opponents(
+                    owner, target):
+                continue
+            if math.hypot(
+                target["r"] - projectile["r"],
+                target["c"] - projectile["c"],
+            ) <= 4.0:
+                target["blind_remaining"] = max(
+                    target.get("blind_remaining", 0.0),
+                    SKILL_BLIND_TIME,
+                )
+
+    def _finish_teleport_projectile(self, projectile):
+        owner = next(
+            (
+                p for p in self.mp_players
+                if p["id"] == projectile["owner_id"]
+            ),
+            None,
+        )
+        if owner is None or not owner["alive"] \
+                or owner.get("imprisoned") or owner.get("carried"):
+            return
+        r = int(round(projectile.get("last_r", projectile["r"])))
+        c = int(round(projectile.get("last_c", projectile["c"])))
+        owner["r"], owner["c"] = nearest_free(
+            self.walls, r, c, self.gates
+        )
+
+    def _update_projectiles(self, dt):
+        active = []
+        rows = len(self.walls)
+        cols = len(self.walls[0]) if rows else 0
+        for projectile in self.mp_projectiles:
+            speed = math.hypot(projectile["vr"], projectile["vc"])
+            steps = max(1, int(math.ceil(speed * dt / 0.2)))
+            step_dt = dt / steps
+            finished = False
+            for _ in range(steps):
+                projectile["last_r"] = projectile["r"]
+                projectile["last_c"] = projectile["c"]
+                projectile["r"] += projectile["vr"] * step_dt
+                projectile["c"] += projectile["vc"] * step_dt
+                projectile["traveled"] += speed * step_dt
+
+                rr = int(round(projectile["r"]))
+                cc = int(round(projectile["c"]))
+                outside = not (0 <= rr < rows and 0 <= cc < cols)
+                wall_hit = outside or is_wall(
+                    self.walls, rr, cc, self.gates
+                )
+                kind = projectile["kind"]
+
+                if kind == "spear":
+                    owner = next(
+                        (
+                            p for p in self.mp_players
+                            if p["id"] == projectile["owner_id"]
+                        ),
+                        None,
+                    )
+                    if owner is not None:
+                        for target in self.mp_players:
+                            if target["id"] == owner["id"] \
+                                    or not target["alive"] \
+                                    or target.get("imprisoned") \
+                                    or target.get("carried") \
+                                    or not self._players_are_opponents(
+                                        owner, target):
+                                continue
+                            if math.hypot(
+                                target["r"] - projectile["r"],
+                                target["c"] - projectile["c"],
+                            ) <= 0.5:
+                                frac = min(
+                                    1.0,
+                                    projectile["traveled"]
+                                    / max(1.0, projectile["max_range"]),
+                                )
+                                target["stun_remaining"] = max(
+                                    target.get("stun_remaining", 0.0),
+                                    0.7 + 9.3 * frac,
+                                )
+                                finished = True
+                                break
+                    if outside:
+                        finished = True
+                elif wall_hit or projectile["traveled"] >= projectile["max_range"]:
+                    if kind == "flash":
+                        self._explode_flash(projectile)
+                    elif kind == "teleport":
+                        self._finish_teleport_projectile(projectile)
+                    finished = True
+
+                if projectile["traveled"] >= projectile["max_range"]:
+                    if kind == "spear":
+                        finished = True
+                    elif not finished:
+                        if kind == "flash":
+                            self._explode_flash(projectile)
+                        elif kind == "teleport":
+                            self._finish_teleport_projectile(projectile)
+                        finished = True
+                if finished:
+                    break
+            if not finished:
+                active.append(projectile)
+        self.mp_projectiles = active
+
+    def _reset_trap_check(self, p, reset_chain=False):
+        if reset_chain:
+            p["trap_checks_remaining"] = TRAP_CHECK_COUNT
+        p["trap_check_elapsed"] = 0.0
+        p["trap_check_target"] = random.uniform(
+            0.45, 0.95 - TRAP_CHECK_WIDTH
+        )
+
+    def _update_traps(self, dt, skill_presses):
+        remaining_traps = []
+        for trap in self.mp_traps:
+            triggered = None
+            for runner in self.mp_players:
+                if runner.get("role") != "runner" or not runner["alive"] \
+                        or runner.get("downed") or runner.get("carried") \
+                        or runner.get("imprisoned") or runner.get("trapped"):
+                    continue
+                if (runner["r"], runner["c"]) == (trap["r"], trap["c"]):
+                    triggered = runner
+                    break
+            if triggered is None:
+                remaining_traps.append(trap)
+                continue
+            triggered["trapped"] = True
+            triggered["trap_checks_remaining"] = TRAP_CHECK_COUNT
+            self._reset_trap_check(triggered)
+        self.mp_traps = remaining_traps
+
+        for p in self.mp_players:
+            if not p.get("trapped"):
+                continue
+            p["trap_check_elapsed"] += dt
+            needle = min(
+                1.0,
+                p["trap_check_elapsed"] / TRAP_CHECK_DURATION,
+            )
+            start = p["trap_check_target"]
+            end = start + p.get("trap_check_width", TRAP_CHECK_WIDTH)
+            success = False
+            attempted = False
+            if p.get("is_bot") and needle >= start + (end - start) / 2:
+                attempted = True
+                success = True
+            elif p["id"] in skill_presses:
+                attempted = True
+                success = start <= needle <= end
+            elif needle >= 1.0:
+                attempted = True
+
+            if not attempted:
+                continue
+            if success:
+                p["trap_checks_remaining"] -= 1
+                if p["trap_checks_remaining"] <= 0:
+                    p["trapped"] = False
+                    p["trap_check_elapsed"] = 0.0
+                    continue
+                self._reset_trap_check(p)
+            else:
+                self._reset_trap_check(p, True)
+
+    def _update_skill_orbs(self, dt):
+        self.mp_orb_timer -= dt
+        if self.mp_orb_timer <= 0:
+            if len(self.mp_skill_orbs) < SKILL_ORB_MAX:
+                self._spawn_skill_orb()
+            self.mp_orb_timer = random.uniform(
+                SKILL_ORB_SPAWN_MIN, SKILL_ORB_SPAWN_MAX
+            )
+
+        remaining = []
+        for orb in self.mp_skill_orbs:
+            collector = next(
+                (
+                    p for p in self.mp_players
+                    if p["alive"]
+                    and not p.get("carried")
+                    and not p.get("imprisoned")
+                    and not p.get("downed")
+                    and (p["r"], p["c"]) == (orb["r"], orb["c"])
+                    and len(p.get("skills", [])) < 2
+                ),
+                None,
+            )
+            if collector is None:
+                remaining.append(orb)
+                continue
+            collector.setdefault("skills", []).append(
+                random.choice(RANDOM_SKILLS)
+            )
+        self.mp_skill_orbs = remaining
+
     def _dbd_tick(self, dt):
         """Generators, catches, imprisonment, rescues, win conditions."""
         # match timer
@@ -2346,6 +3024,33 @@ class Game:
             return
 
         skill_presses = self._consume_skill_check_presses()
+        attack_presses = self._consume_input_sequence(
+            "attack_seq", self.mp_attack_seen
+        )
+        interact_presses = self._consume_input_sequence(
+            "interact_seq", self.mp_interact_seen
+        )
+        use_presses = self._consume_input_sequence(
+            "use_seq", self.mp_use_seen
+        )
+
+        hunter = next(
+            (p for p in self.mp_players if p["role"] == "hunter"),
+            None,
+        )
+        if hunter is not None:
+            if hunter["id"] in attack_presses:
+                self._handle_hunter_attack(hunter)
+            if hunter["id"] in interact_presses:
+                self._handle_hunter_interact(hunter)
+
+        for p in self.mp_players:
+            if p["id"] in use_presses:
+                self._activate_selected_skill(p)
+
+        self._update_projectiles(dt)
+        self._update_traps(dt, skill_presses)
+        self._update_skill_orbs(dt)
 
         # Generators: repair speed stacks; one shared skill check can interrupt it.
         for gen in self.mp_generators:
@@ -2357,7 +3062,8 @@ class Game:
             for p in self.mp_players:
                 if p["role"] != "runner" or not p["alive"] \
                         or p.get("imprisoned") or p.get("carried") \
-                        or p.get("stun_remaining", 0.0) > 0:
+                        or p.get("stun_remaining", 0.0) > 0 \
+                        or p.get("downed") or p.get("trapped"):
                     continue
                 inp = self.mp_pending_input.get(p["id"], {})
                 if gen.is_adjacent(p["r"], p["c"]) and inp.get("e_held"):
@@ -2420,34 +3126,11 @@ class Game:
         if not self.exit_unlocked and all(g.completed for g in self.mp_generators):
             self.exit_unlocked = True
 
-        # hunter catches: hunter shares cell with a runner
-        hunter = next((p for p in self.mp_players if p["role"] == "hunter"), None)
+        # Carrying and imprisonment. Contact alone never catches a runner.
         if hunter and hunter["alive"]:
-            if hunter.get("catch_cooldown", 0) > 0:
-                hunter["catch_cooldown"] -= dt
-            elif hunter.get("carrying_pid") is None:
-                old_positions = getattr(self, "mp_prev_positions", {})
-                hunter_old = old_positions.get(
-                    hunter["id"], (hunter["r"], hunter["c"])
-                )
-                for p in self.mp_players:
-                    if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
-                        continue
-                    runner_old = old_positions.get(p["id"], (p["r"], p["c"]))
-                    same_cell = (p["r"], p["c"]) == (hunter["r"], hunter["c"])
-                    crossed = runner_old == (hunter["r"], hunter["c"]) \
-                        and hunter_old == (p["r"], p["c"])
-                    if same_cell or crossed:
-                        hunter["carrying_pid"] = p["id"]
-                        p["carried"] = True
-                        p["carry_timer"] = HUNTER_CARRY_TIME
-                        p["ai_state"] = "idle"
-                        p["ai_target_pos"] = None
-                        break
-            else:
+            if hunter.get("carrying_pid") is not None:
                 carried_runner = next((p for p in self.mp_players if p["id"] == hunter["carrying_pid"]), None)
                 if carried_runner:
-                    carried_runner["carry_timer"] -= dt
                     carried_runner["r"] = hunter["r"]
                     carried_runner["c"] = hunter["c"]
 
@@ -2461,15 +3144,6 @@ class Game:
                         carried_runner["carried"] = False
                         hunter["carrying_pid"] = None
                         self._imprison_runner_in(carried_runner, put_in_wh)
-                    elif carried_runner["carry_timer"] <= 0:
-                        carried_runner["carried"] = False
-                        hunter["carrying_pid"] = None
-                        hunter["catch_cooldown"] = 2.0
-                        for dr, dc in ((0, 1), (1, 0), (0, -1), (-1, 0)):
-                            nr, nc = hunter["r"] + dr, hunter["c"] + dc
-                            if not is_wall(self.walls, nr, nc, self.gates):
-                                carried_runner["r"], carried_runner["c"] = nr, nc
-                                break
                 else:
                     hunter["carrying_pid"] = None
 
@@ -2480,7 +3154,8 @@ class Game:
             for p in self.mp_players:
                 if p["role"] != "runner" or not p["alive"] or p.get("imprisoned") or p.get("carried"):
                     continue
-                if p.get("stun_remaining", 0.0) > 0:
+                if p.get("stun_remaining", 0.0) > 0 \
+                        or p.get("downed") or p.get("trapped"):
                     continue
                 if w.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
@@ -2508,6 +3183,10 @@ class Game:
 
     def _imprison_runner_in(self, runner, w):
         runner["r"], runner["c"] = w.r, w.c
+        runner["downed"] = False
+        runner["downed_remaining"] = 0.0
+        runner["trapped"] = False
+        runner["trap_checks_remaining"] = 0
         runner["imprisoned"] = True
         runner["imprison_remaining"] = FREEZING_POD_IMPRISON
         w.imprisoned_pid = runner["id"]
@@ -2606,6 +3285,7 @@ class Game:
             elif t == "start":
                 self.mp_mode   = msg.get("mode", "escape")
                 self.mp_winner = ""
+                self._reset_local_action_sequences()
                 if self.state in ("lobby_wait_client", "mp_end"):
                     self.state = "mp_play"
             elif t == "end":
@@ -2624,6 +3304,100 @@ class Game:
             self.client.send({"type": "input", **self.mp_local_input})
 
     # ── multiplayer render ────────────────────────────────────────────────────
+    def _draw_dbd_objects(self):
+        for orb in self.mp_skill_orbs:
+            x, y = cell_xy(int(orb["r"]), int(orb["c"]))
+            pulse = 1.0 + 0.15 * math.sin(
+                pygame.time.get_ticks() / 180.0 + x + y
+            )
+            radius = max(5, int(CELL * 0.22 * pulse))
+            glow = pygame.Surface((radius * 4, radius * 4), pygame.SRCALPHA)
+            pygame.draw.circle(
+                glow, (80, 220, 255, 60),
+                (radius * 2, radius * 2), radius * 2,
+            )
+            self.surf.blit(glow, (x - radius * 2, y - radius * 2))
+            pygame.draw.circle(self.surf, (80, 220, 255), (x, y), radius)
+            pygame.draw.circle(self.surf, WHITE, (x, y), radius, 2)
+
+        for trap in self.mp_traps:
+            x, y = cell_xy(int(trap["r"]), int(trap["c"]))
+            size = max(5, int(CELL * 0.28))
+            points = [
+                (x - size, y + size // 2),
+                (x, y - size),
+                (x + size, y + size // 2),
+            ]
+            pygame.draw.polygon(self.surf, (180, 70, 30), points)
+            pygame.draw.polygon(self.surf, (255, 160, 60), points, 2)
+
+        for projectile in self.mp_projectiles:
+            x = int(projectile["c"] * CELL + MAZE_OX + CELL // 2)
+            y = int(projectile["r"] * CELL + MAZE_OY + CELL // 2)
+            kind = projectile["kind"]
+            color = SKILL_COLORS.get(kind, WHITE)
+            if kind == "spear":
+                length = max(7, int(CELL * 0.55))
+                speed = max(
+                    0.001, math.hypot(projectile["vr"], projectile["vc"])
+                )
+                dx = int(projectile["vc"] / speed * length)
+                dy = int(projectile["vr"] / speed * length)
+                pygame.draw.line(
+                    self.surf, color,
+                    (x - dx, y - dy), (x + dx, y + dy), 4,
+                )
+            else:
+                radius = max(5, int(CELL * 0.2))
+                pygame.draw.circle(self.surf, color, (x, y), radius)
+                pygame.draw.circle(self.surf, WHITE, (x, y), radius, 2)
+
+            if kind == "teleport" \
+                    and projectile["owner_id"] == self.player_id:
+                self._draw_teleport_prediction(projectile)
+
+    def _draw_teleport_prediction(self, projectile):
+        r = float(projectile["r"])
+        c = float(projectile["c"])
+        speed = max(0.001, math.hypot(projectile["vr"], projectile["vc"]))
+        dr = projectile["vr"] / speed
+        dc = projectile["vc"] / speed
+        remaining = min(
+            6.0,
+            max(0.0, projectile["max_range"] - projectile["traveled"]),
+        )
+        landing = (r, c)
+        step = 0.35
+        distance = step
+        while distance <= remaining:
+            nr, nc = r + dr * distance, c + dc * distance
+            rr, cc = int(round(nr)), int(round(nc))
+            if is_wall(self.walls, rr, cc, self.gates):
+                break
+            landing = (nr, nc)
+            if int(distance / step) % 2 == 0:
+                x = int(nc * CELL + MAZE_OX + CELL // 2)
+                y = int(nr * CELL + MAZE_OY + CELL // 2)
+                pygame.draw.circle(self.surf, (100, 255, 235), (x, y), 3)
+            distance += step
+        lx = int(landing[1] * CELL + MAZE_OX + CELL // 2)
+        ly = int(landing[0] * CELL + MAZE_OY + CELL // 2)
+        pygame.draw.circle(
+            self.surf, (100, 255, 235),
+            (lx, ly), max(6, CELL // 3), 2,
+        )
+
+    def _draw_blind_overlay(self, me):
+        if me is None or me.get("blind_remaining", 0.0) <= 0:
+            return
+        overlay = pygame.Surface((PANEL_X, H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 248))
+        x, y = cell_xy(me["r"], me["c"])
+        pygame.draw.circle(
+            overlay, (0, 0, 0, 0), (x, y), max(CELL * 2, 36)
+        )
+        self.surf.blit(overlay, (0, 0))
+
     def draw_mp_play(self):
         self.draw_maze()
 
@@ -2635,6 +3409,8 @@ class Game:
             gen.draw(self.surf)
         for w in self.mp_freezing_pods:
             w.draw(self.surf)
+        if self.mp_mode == "dbd":
+            self._draw_dbd_objects()
 
         # portals (escape mode only)
         if self.mp_mode == "escape":
@@ -2653,9 +3429,17 @@ class Game:
                              (ex - CELL // 3, ey + CELL // 3),
                              (ex + CELL // 3, ey - CELL // 3), 3)
 
+        me = next(
+            (p for p in self.mp_players if p["id"] == self.player_id),
+            None,
+        )
+
         # players
         for p in self.mp_players:
             if not p["alive"]:
+                continue
+            if p["id"] != self.player_id \
+                    and p.get("invisible_remaining", 0.0) > 0:
                 continue
             # any player with role=hunter (DBD or ESCAPE-with-player-hunter) is red
             if p.get("role") == "hunter":
@@ -2674,7 +3458,7 @@ class Game:
                     arc_color = (255, 80, 80)
                 else:
                     pygame.draw.circle(self.surf, (255, 220, 0), (x, y), radius, 2)
-                    frac = max(0.0, p.get("carry_timer", 0)) / HUNTER_CARRY_TIME
+                    frac = 1.0
                     arc_color = (255, 220, 0)
 
                 # remaining-time arc
@@ -2683,6 +3467,13 @@ class Game:
                 pygame.draw.arc(self.surf, arc_color, arc_rect,
                                 -math.pi / 2,
                                 -math.pi / 2 + math.tau * frac, 3)
+            elif p.get("downed"):
+                body = pygame.Rect(
+                    x - radius, y - radius // 2,
+                    radius * 2, max(4, radius),
+                )
+                pygame.draw.ellipse(self.surf, color, body)
+                pygame.draw.ellipse(self.surf, (255, 220, 0), body, 2)
             else:
                 glow = pygame.Surface((radius * 4, radius * 4), pygame.SRCALPHA)
                 pygame.draw.circle(glow, (*color, 60),
@@ -2697,13 +3488,97 @@ class Game:
                 pygame.draw.circle(
                     self.surf, (255, 220, 0), (x, y), radius + 5, 3
                 )
+            if p.get("trapped"):
+                pygame.draw.circle(
+                    self.surf, (255, 120, 40), (x, y), radius + 7, 3
+                )
+            if p.get("attack_anim", 0.0) > 0:
+                tip_x = x + int(p.get("facing_c", 1.0) * CELL * 1.1)
+                tip_y = y + int(p.get("facing_r", 0.0) * CELL * 1.1)
+                pygame.draw.line(
+                    self.surf, (255, 245, 220), (x, y), (tip_x, tip_y), 5
+                )
+            if p["id"] == self.player_id:
+                tip_x = x + int(p.get("facing_c", 1.0) * CELL * 0.65)
+                tip_y = y + int(p.get("facing_r", 0.0) * CELL * 0.65)
+                pygame.draw.line(
+                    self.surf, WHITE, (x, y), (tip_x, tip_y), 2
+                )
 
         # bot hunter (escape mode only)
         if self.mp_mode == "escape" and self.hunter is not None:
             self.hunter.draw(self.surf)
 
+        self._draw_blind_overlay(me)
         self.draw_mp_panel()
+        self.draw_skill_inventory(me)
         self.draw_skill_check()
+
+    def draw_skill_inventory(self, me):
+        if self.mp_mode != "dbd" or me is None:
+            return
+        skills = me.get("skills", [])
+        slot_size = 58
+        gap = 8
+        start_x = W - 24 - slot_size * 2 - gap
+        y = H - slot_size - 24
+        selected = min(
+            self.mp_selected_skill, max(0, len(skills) - 1)
+        )
+        for index in range(2):
+            x = start_x + index * (slot_size + gap)
+            rect = pygame.Rect(x, y, slot_size, slot_size)
+            skill = skills[index] if index < len(skills) else None
+            color = SKILL_COLORS.get(skill, (45, 45, 55))
+            pygame.draw.rect(self.surf, (20, 24, 34), rect)
+            pygame.draw.rect(
+                self.surf, color, rect,
+                4 if index == selected and skill else 2,
+            )
+            if skill:
+                icon = self.font_sm.render(
+                    SKILL_NAMES[skill][:3], True, color
+                )
+                self.surf.blit(
+                    icon,
+                    (
+                        rect.centerx - icon.get_width() // 2,
+                        rect.centery - icon.get_height() // 2,
+                    ),
+                )
+                if skill == "trap" and me.get("trap_cooldown", 0.0) > 0:
+                    cooldown = self.font_sm.render(
+                        f"{me['trap_cooldown']:.1f}", True, WHITE
+                    )
+                    self.surf.blit(
+                        cooldown,
+                        (
+                            rect.centerx - cooldown.get_width() // 2,
+                            rect.bottom - cooldown.get_height() - 2,
+                        ),
+                    )
+
+        hint = self.font_sm.render("F USE   WHEEL SWITCH", True, (170, 170, 170))
+        self.surf.blit(
+            hint,
+            (W - 24 - hint.get_width(), y - hint.get_height() - 6),
+        )
+
+        effects = []
+        for key, label in (
+            ("speed_remaining", "SPRINT"),
+            ("invisible_remaining", "INVIS"),
+            ("phase_remaining", "PHASE"),
+            ("blind_remaining", "BLIND"),
+        ):
+            if me.get(key, 0.0) > 0:
+                effects.append(f"{label} {me[key]:.1f}s")
+        if effects:
+            text = self.font_sm.render("  ".join(effects), True, WHITE)
+            self.surf.blit(
+                text,
+                (W - 24 - text.get_width(), y - hint.get_height() - text.get_height() - 12),
+            )
 
     def draw_skill_check(self):
         if self.mp_mode != "dbd":
@@ -2725,15 +3600,32 @@ class Game:
             x = PANEL_X // 2 - text.get_width() // 2
             self.surf.blit(text, (x, 32))
 
-        gen = next(
-            (
-                g for g in self.mp_generators
-                if g.skill_active and g.skill_owner_id == self.player_id
-            ),
-            None,
-        )
-        if gen is None:
-            return
+        if me.get("trapped"):
+            label_text = (
+                f"TRAP ESCAPE  {me.get('trap_checks_remaining', 0)} LEFT"
+                "  -  PRESS SPACE"
+            )
+            elapsed = me.get("trap_check_elapsed", 0.0)
+            duration = TRAP_CHECK_DURATION
+            target_start = me.get("trap_check_target", 0.6)
+            target_width = me.get("trap_check_width", TRAP_CHECK_WIDTH)
+            border_color = (255, 130, 40)
+        else:
+            gen = next(
+                (
+                    g for g in self.mp_generators
+                    if g.skill_active and g.skill_owner_id == self.player_id
+                ),
+                None,
+            )
+            if gen is None:
+                return
+            label_text = "SKILL CHECK  -  PRESS SPACE"
+            elapsed = gen.skill_elapsed
+            duration = gen.skill_duration
+            target_start = gen.skill_target_start
+            target_width = gen.skill_target_width
+            border_color = (255, 220, 0)
 
         panel_w = min(640, PANEL_X - 80)
         panel_h = 120
@@ -2743,12 +3635,12 @@ class Game:
         panel.fill((0, 0, 0, 225))
         self.surf.blit(panel, (panel_x, panel_y))
         pygame.draw.rect(
-            self.surf, (255, 220, 0),
+            self.surf, border_color,
             (panel_x, panel_y, panel_w, panel_h), 2,
         )
 
         label = self.font_med.render(
-            "SKILL CHECK  -  PRESS SPACE", True, WHITE
+            label_text, True, WHITE
         )
         self.surf.blit(
             label,
@@ -2764,15 +3656,15 @@ class Game:
             (bar_x, bar_y, bar_w, bar_h),
         )
 
-        target_x = bar_x + int(bar_w * gen.skill_target_start)
-        target_w = max(4, int(bar_w * gen.skill_target_width))
+        target_x = bar_x + int(bar_w * target_start)
+        target_w = max(4, int(bar_w * target_width))
         pygame.draw.rect(
             self.surf, (80, 220, 100),
             (target_x, bar_y, target_w, bar_h),
         )
 
         needle = min(
-            1.0, gen.skill_elapsed / max(0.01, gen.skill_duration)
+            1.0, elapsed / max(0.01, duration)
         )
         needle_x = bar_x + int(bar_w * needle)
         pygame.draw.line(
@@ -2840,7 +3732,11 @@ class Game:
             elif p.get("imprisoned"):
                 status = f"IMPRISONED {p['imprison_remaining']:.0f}s"
             elif p.get("carried"):
-                status = f"CARRIED {p['carry_timer']:.1f}s"
+                status = "CARRIED"
+            elif p.get("downed"):
+                status = f"DOWNED {p['downed_remaining']:.1f}s"
+            elif p.get("trapped"):
+                status = f"TRAPPED {p['trap_checks_remaining']}"
             elif p.get("stun_remaining", 0.0) > 0:
                 status = f"STUNNED {p['stun_remaining']:.1f}s"
             else:
@@ -2859,8 +3755,9 @@ class Game:
         else:
             hints = [
                 "WASD / ARROWS : MOVE",
-                "HOLD E : repair / rescue / gate",
-                "SPACE : skill check",
+                "E : interact / pick up / drop",
+                "SPACE / CLICK : slash / skill check",
+                "F : use skill",
                 "ESC : leave match",
             ]
         for i, hint in enumerate(hints):
@@ -2997,6 +3894,13 @@ class Game:
 
                     elif self.state == "mp_play" and event.key == pygame.K_SPACE:
                         self.mp_skill_seq += 1
+                        self.mp_attack_seq += 1
+
+                    elif self.state == "mp_play" and event.key == pygame.K_e:
+                        self.mp_interact_seq += 1
+
+                    elif self.state == "mp_play" and event.key == pygame.K_f:
+                        self.mp_use_seq += 1
 
                     elif self.state == "menu":
                         if event.key in (pygame.K_UP, pygame.K_w):
@@ -3097,7 +4001,9 @@ class Game:
 
                 # mouse clicks
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if self.state == "menu":
+                    if self.state == "mp_play":
+                        self.mp_attack_seq += 1
+                    elif self.state == "menu":
                         self.handle_menu_click(event.pos)
                     elif self.state == "lobby":
                         self.handle_lobby_click(event.pos)
@@ -3115,6 +4021,22 @@ class Game:
                         self.btn_maze.handle_click(event.pos)
                         self.btn_hunter.handle_click(event.pos)
                         self.btn_portals.handle_click(event.pos)
+
+                if event.type == pygame.MOUSEWHEEL \
+                        and self.state == "mp_play":
+                    me = next(
+                        (
+                            p for p in self.mp_players
+                            if p["id"] == self.player_id
+                        ),
+                        None,
+                    )
+                    skill_count = len(me.get("skills", [])) if me else 0
+                    if skill_count:
+                        direction = -1 if event.y > 0 else 1
+                        self.mp_selected_skill = (
+                            self.mp_selected_skill + direction
+                        ) % skill_count
 
             if self.state == "play":
                 pressed = pygame.key.get_pressed()
@@ -3173,6 +4095,7 @@ class Game:
                             self.mp_map_votes = {int(k): v for k, v in self.mp_map_votes.items()}
                         elif msg.get("type") == "start":
                             self.state = "mp_play"
+                            self._reset_local_action_sequences()
                             self._apply_state(msg)
             elif self.state == "lobby_wait_host" and self.server is not None:
                 # accept hellos, send welcomes
@@ -3190,6 +4113,7 @@ class Game:
                         self.mp_map_votes = {}
                     elif msg.get("type") == "start":
                         self.state = "mp_play"
+                        self._reset_local_action_sequences()
                         self._apply_state(msg)
 
             elif self.state == "mp_end":
@@ -3211,9 +4135,30 @@ class Game:
                     dr, dc = 0, 1
                 else:
                     dr, dc = 0, 0
+                me = next(
+                    (
+                        p for p in self.mp_players
+                        if p["id"] == self.player_id
+                    ),
+                    None,
+                )
+                skill_count = len(me.get("skills", [])) if me else 0
+                if skill_count:
+                    self.mp_selected_skill %= skill_count
+                else:
+                    self.mp_selected_skill = 0
+                mouse_x, mouse_y = pygame.mouse.get_pos()
+                aim_c = (mouse_x - MAZE_OX - CELL / 2) / CELL
+                aim_r = (mouse_y - MAZE_OY - CELL / 2) / CELL
                 self.mp_local_input = {
                     "dr": dr, "dc": dc, "e_held": pressed[pygame.K_e],
                     "skill_seq": self.mp_skill_seq,
+                    "attack_seq": self.mp_attack_seq,
+                    "interact_seq": self.mp_interact_seq,
+                    "use_seq": self.mp_use_seq,
+                    "selected_skill": self.mp_selected_skill,
+                    "aim_r": aim_r,
+                    "aim_c": aim_c,
                 }
 
                 if self.server is not None:
