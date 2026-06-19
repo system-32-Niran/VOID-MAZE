@@ -12,6 +12,9 @@ from collections import deque
 import network
 import maps.map_dbd
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSET_DIR = os.path.join(BASE_DIR, "assets")
+
 # Place the borderless window at the top-left of the primary display.
 # Must be set BEFORE pygame.init() / display.set_mode for SDL to pick it up.
 os.environ.setdefault("SDL_VIDEO_WINDOW_POS", "0,0")
@@ -445,6 +448,23 @@ SKILL_COLORS = {
     "trap": (255, 130, 40),
 }
 RANDOM_SKILLS = ("speed", "invisible", "phase", "spear", "flash", "teleport")
+SKILL_ICON_CELLS = {
+    "speed": (0, 0),
+    "invisible": (1, 0),
+    "phase": (2, 0),
+    "spear": (3, 0),
+    "flash": (0, 1),
+    "teleport": (1, 1),
+    "trap": (2, 1),
+}
+ITEM_ATLAS_CELLS = {
+    "cleaver": (0, 0),
+    "spear": (1, 0),
+    "flash": (2, 0),
+    "teleport": (0, 1),
+    "trap": (1, 1),
+    "toolkit": (2, 1),
+}
 
 
 class Generator:
@@ -648,6 +668,8 @@ class Game:
         self.font_lg  = pygame.font.Font(None, 54)
         self.font_med = pygame.font.Font(None, 40)
         self.font_sm  = pygame.font.Font(None, 30)
+        self.font_tiny = pygame.font.Font(None, 23)
+        self._load_visual_assets()
 
         # ── toggle buttons (positioned in panel) ─────────────────────────────
         bx = PANEL_X + 30
@@ -727,6 +749,84 @@ class Game:
 
         self.state = "menu"
         self.reset()
+
+    @staticmethod
+    def _atlas_cell(atlas, col, row, columns, rows):
+        cell_w = atlas.get_width() // columns
+        cell_h = atlas.get_height() // rows
+        return atlas.subsurface(
+            pygame.Rect(col * cell_w, row * cell_h, cell_w, cell_h)
+        ).copy()
+
+    def _load_visual_assets(self):
+        self.actor_sprites = {}
+        self.item_sprites = {}
+        self.skill_icons = {}
+        self.floor_tile = None
+        self.wall_tile = None
+        self.panel_surface = pygame.Surface((PANEL_W, H))
+        panel_draw = pygame.draw
+        for y in range(H):
+            mix = y / max(1, H - 1)
+            color = (
+                int(10 - 3 * mix),
+                int(17 - 5 * mix),
+                int(27 - 5 * mix),
+            )
+            panel_draw.line(self.panel_surface, color, (0, y), (PANEL_W, y))
+        for x in range(0, PANEL_W, 32):
+            panel_draw.line(
+                self.panel_surface, (12, 25, 36),
+                (x, 0), (x, H), 1,
+            )
+
+        try:
+            characters = pygame.image.load(
+                os.path.join(ASSET_DIR, "character_atlas.png")
+            ).convert_alpha()
+            items = pygame.image.load(
+                os.path.join(ASSET_DIR, "item_atlas.png")
+            ).convert_alpha()
+            icons = pygame.image.load(
+                os.path.join(ASSET_DIR, "skill_icons.png")
+            ).convert_alpha()
+            environment = pygame.image.load(
+                os.path.join(ASSET_DIR, "environment_atlas.png")
+            ).convert()
+        except (pygame.error, FileNotFoundError):
+            self.maze_floor_surface = None
+            return
+
+        actor_size = max(34, int(CELL * 1.7))
+        for role, col in (("hunter", 0), ("runner", 1)):
+            source = self._atlas_cell(characters, col, 0, 2, 1)
+            self.actor_sprites[role] = pygame.transform.smoothscale(
+                source, (actor_size, actor_size)
+            )
+
+        item_size = max(24, int(CELL * 1.12))
+        for name, (col, row) in ITEM_ATLAS_CELLS.items():
+            source = self._atlas_cell(items, col, row, 3, 2)
+            self.item_sprites[name] = pygame.transform.smoothscale(
+                source, (item_size, item_size)
+            )
+
+        for name, (col, row) in SKILL_ICON_CELLS.items():
+            source = self._atlas_cell(icons, col, row, 4, 2)
+            self.skill_icons[name] = pygame.transform.smoothscale(
+                source, (48, 48)
+            )
+
+        floor = self._atlas_cell(environment, 0, 0, 2, 1)
+        wall = self._atlas_cell(environment, 1, 0, 2, 1)
+        self.floor_tile = pygame.transform.smoothscale(floor, (CELL, CELL))
+        self.wall_tile = pygame.transform.smoothscale(wall, (CELL, CELL))
+        self.maze_floor_surface = pygame.Surface((MAZE_W, MAZE_H))
+        for r in range(ROWS):
+            for c in range(COLS):
+                self.maze_floor_surface.blit(
+                    self.floor_tile, (c * CELL, r * CELL)
+                )
 
     # ── reset / level ─────────────────────────────────────────────────────────
     def reset(self):
@@ -822,7 +922,9 @@ class Game:
 
     # ── drawing ───────────────────────────────────────────────────────────────
     def draw_maze(self):
-        self.surf.fill(BLACK)
+        self.surf.fill((2, 5, 9))
+        if self.maze_floor_surface is not None:
+            self.surf.blit(self.maze_floor_surface, (MAZE_OX, MAZE_OY))
 
         gate_cells = {(g.r, g.c) for g in self.gates}
 
@@ -831,8 +933,16 @@ class Game:
                 if self.walls[r][c] and (r, c) not in gate_cells:
                     rect = pygame.Rect(c * CELL + MAZE_OX, r * CELL + MAZE_OY,
                                        CELL, CELL)
-                    pygame.draw.rect(self.surf, (0, 40, 70),   rect)
-                    pygame.draw.rect(self.surf, (0, 90, 140),  rect, 1)
+                    if self.wall_tile is not None:
+                        self.surf.blit(self.wall_tile, rect)
+                    else:
+                        pygame.draw.rect(self.surf, (0, 40, 70), rect)
+                        pygame.draw.rect(self.surf, (0, 90, 140), rect, 1)
+
+        pygame.draw.rect(
+            self.surf, (14, 83, 106),
+            (MAZE_OX, MAZE_OY, MAZE_W, MAZE_H), 2,
+        )
 
     def draw_exit(self):
         er, ec = self.exit_pos
@@ -1416,6 +1526,8 @@ class Game:
             "trap_check_width": TRAP_CHECK_WIDTH,
             "facing_r": 0.0,
             "facing_c": 1.0,
+            "aim_r": float(p["r"]),
+            "aim_c": float(p["c"] + 1),
             "selected_skill": 0,
             "skills": (
                 ["trap", random_skill]
@@ -1816,8 +1928,16 @@ class Game:
                     max(0, len(p.get("skills", [])) - 1),
                 )
             )
-            aim_dr = float(inp.get("aim_r", p["r"])) - p["r"]
-            aim_dc = float(inp.get("aim_c", p["c"] + 1)) - p["c"]
+            rows = len(self.walls)
+            cols = len(self.walls[0]) if rows else 0
+            p["aim_r"] = max(
+                0.0, min(float(inp.get("aim_r", p["r"])), rows - 1.0)
+            )
+            p["aim_c"] = max(
+                0.0, min(float(inp.get("aim_c", p["c"] + 1)), cols - 1.0)
+            )
+            aim_dr = p["aim_r"] - p["r"]
+            aim_dc = p["aim_c"] - p["c"]
             aim_len = math.hypot(aim_dr, aim_dc)
             if aim_len > 0.001:
                 p["facing_r"] = aim_dr / aim_len
@@ -1833,8 +1953,6 @@ class Game:
             )
             if (dr or dc) and self.mp_move_timers[pid] >= move_delay:
                 nr, nc = p["r"] + dr, p["c"] + dc
-                rows = len(self.walls)
-                cols = len(self.walls[0]) if rows else 0
                 phase_move = p.get("phase_remaining", 0.0) > 0 \
                     and 0 <= nr < rows and 0 <= nc < cols
                 if phase_move or not is_wall(self.walls, nr, nc, self.gates):
@@ -2005,8 +2123,10 @@ class Game:
         dc = target["c"] - p["c"]
         length = max(0.001, math.hypot(dr, dc))
         p["facing_r"], p["facing_c"] = dr / length, dc / length
+        p["aim_r"], p["aim_c"] = float(target["r"]), float(target["c"])
         inp = self.mp_pending_input.setdefault(p["id"], {})
         inp["selected_skill"] = p["selected_skill"]
+        inp["aim_r"], inp["aim_c"] = p["aim_r"], p["aim_c"]
         inp["use_seq"] = int(inp.get("use_seq", 0)) + 1
 
     def _bot_tick(self, dt):
@@ -2732,9 +2852,19 @@ class Game:
             p.get("selected_skill", 0), max(0, len(skills) - 1)
         )
 
-    def _launch_projectile(self, p, kind, speed, max_range):
-        facing_r = p.get("facing_r", 0.0)
-        facing_c = p.get("facing_c", 1.0)
+    def _launch_projectile(self, p, kind, speed, max_range, target=None):
+        target_r = target_c = None
+        if target is not None:
+            rows = len(self.walls)
+            cols = len(self.walls[0]) if rows else 0
+            target_r = max(0.0, min(float(target[0]), rows - 1.0))
+            target_c = max(0.0, min(float(target[1]), cols - 1.0))
+            facing_r = target_r - p["r"]
+            facing_c = target_c - p["c"]
+            max_range = math.hypot(facing_r, facing_c)
+        else:
+            facing_r = p.get("facing_r", 0.0)
+            facing_c = p.get("facing_c", 1.0)
         length = math.hypot(facing_r, facing_c)
         if length <= 0.001:
             facing_r, facing_c = 0.0, 1.0
@@ -2751,6 +2881,9 @@ class Game:
             "traveled": 0.0,
             "max_range": float(max_range),
         })
+        if target is not None:
+            self.mp_projectiles[-1]["target_r"] = target_r
+            self.mp_projectiles[-1]["target_c"] = target_c
 
     def _activate_selected_skill(self, p):
         if not p["alive"] or p.get("stun_remaining", 0.0) > 0 \
@@ -2791,9 +2924,15 @@ class Game:
                 p, "spear", 16.0, math.hypot(rows, cols)
             )
         elif skill == "flash":
-            self._launch_projectile(p, "flash", 7.0, 12.0)
+            self._launch_projectile(
+                p, "flash", 7.0, 0.0,
+                (p.get("aim_r", p["r"]), p.get("aim_c", p["c"])),
+            )
         elif skill == "teleport":
-            self._launch_projectile(p, "teleport", 5.0, 14.0)
+            self._launch_projectile(
+                p, "teleport", 5.0, 0.0,
+                (p.get("aim_r", p["r"]), p.get("aim_c", p["c"])),
+            )
         else:
             return
         self._consume_player_skill(p, index)
@@ -2816,10 +2955,8 @@ class Game:
             if not target["alive"] or not self._players_are_opponents(
                     owner, target):
                 continue
-            if math.hypot(
-                target["r"] - projectile["r"],
-                target["c"] - projectile["c"],
-            ) <= 4.0:
+            if abs(target["r"] - projectile["r"]) <= 1.0 \
+                    and abs(target["c"] - projectile["c"]) <= 1.0:
                 target["blind_remaining"] = max(
                     target.get("blind_remaining", 0.0),
                     SKILL_BLIND_TIME,
@@ -2836,8 +2973,8 @@ class Game:
         if owner is None or not owner["alive"] \
                 or owner.get("imprisoned") or owner.get("carried"):
             return
-        r = int(round(projectile.get("last_r", projectile["r"])))
-        c = int(round(projectile.get("last_c", projectile["c"])))
+        r = int(round(projectile.get("target_r", projectile["r"])))
+        c = int(round(projectile.get("target_c", projectile["c"])))
         owner["r"], owner["c"] = nearest_free(
             self.walls, r, c, self.gates
         )
@@ -2858,13 +2995,22 @@ class Game:
                 projectile["c"] += projectile["vc"] * step_dt
                 projectile["traveled"] += speed * step_dt
 
+                kind = projectile["kind"]
+                reached_target = kind in ("flash", "teleport") \
+                    and projectile["traveled"] >= projectile["max_range"]
+                if reached_target:
+                    projectile["r"] = projectile["target_r"]
+                    projectile["c"] = projectile["target_c"]
+                    if kind == "flash":
+                        self._explode_flash(projectile)
+                    else:
+                        self._finish_teleport_projectile(projectile)
+                    finished = True
+                    break
+
                 rr = int(round(projectile["r"]))
                 cc = int(round(projectile["c"]))
                 outside = not (0 <= rr < rows and 0 <= cc < cols)
-                wall_hit = outside or is_wall(
-                    self.walls, rr, cc, self.gates
-                )
-                kind = projectile["kind"]
 
                 if kind == "spear":
                     owner = next(
@@ -2900,21 +3046,9 @@ class Game:
                                 break
                     if outside:
                         finished = True
-                elif wall_hit or projectile["traveled"] >= projectile["max_range"]:
-                    if kind == "flash":
-                        self._explode_flash(projectile)
-                    elif kind == "teleport":
-                        self._finish_teleport_projectile(projectile)
-                    finished = True
 
                 if projectile["traveled"] >= projectile["max_range"]:
                     if kind == "spear":
-                        finished = True
-                    elif not finished:
-                        if kind == "flash":
-                            self._explode_flash(projectile)
-                        elif kind == "teleport":
-                            self._finish_teleport_projectile(projectile)
                         finished = True
                 if finished:
                     break
@@ -3322,31 +3456,36 @@ class Game:
 
         for trap in self.mp_traps:
             x, y = cell_xy(int(trap["r"]), int(trap["c"]))
-            size = max(5, int(CELL * 0.28))
-            points = [
-                (x - size, y + size // 2),
-                (x, y - size),
-                (x + size, y + size // 2),
-            ]
-            pygame.draw.polygon(self.surf, (180, 70, 30), points)
-            pygame.draw.polygon(self.surf, (255, 160, 60), points, 2)
+            sprite = self.item_sprites.get("trap")
+            if sprite is not None:
+                pulse = 1.0 + 0.06 * math.sin(
+                    pygame.time.get_ticks() / 130.0 + x + y
+                )
+                size = max(22, int(CELL * 1.0 * pulse))
+                shown = pygame.transform.smoothscale(sprite, (size, size))
+                self.surf.blit(shown, shown.get_rect(center=(x, y)))
+            else:
+                size = max(5, int(CELL * 0.28))
+                points = [
+                    (x - size, y + size // 2),
+                    (x, y - size),
+                    (x + size, y + size // 2),
+                ]
+                pygame.draw.polygon(self.surf, (180, 70, 30), points)
+                pygame.draw.polygon(self.surf, (255, 160, 60), points, 2)
 
         for projectile in self.mp_projectiles:
             x = int(projectile["c"] * CELL + MAZE_OX + CELL // 2)
             y = int(projectile["r"] * CELL + MAZE_OY + CELL // 2)
             kind = projectile["kind"]
             color = SKILL_COLORS.get(kind, WHITE)
-            if kind == "spear":
-                length = max(7, int(CELL * 0.55))
-                speed = max(
-                    0.001, math.hypot(projectile["vr"], projectile["vc"])
-                )
-                dx = int(projectile["vc"] / speed * length)
-                dy = int(projectile["vr"] / speed * length)
-                pygame.draw.line(
-                    self.surf, color,
-                    (x - dx, y - dy), (x + dx, y + dy), 4,
-                )
+            sprite = self.item_sprites.get(kind)
+            if sprite is not None:
+                angle = -math.degrees(math.atan2(
+                    projectile["vr"], projectile["vc"]
+                ))
+                shown = pygame.transform.rotozoom(sprite, angle, 0.92)
+                self.surf.blit(shown, shown.get_rect(center=(x, y)))
             else:
                 radius = max(5, int(CELL * 0.2))
                 pygame.draw.circle(self.surf, color, (x, y), radius)
@@ -3359,29 +3498,25 @@ class Game:
     def _draw_teleport_prediction(self, projectile):
         r = float(projectile["r"])
         c = float(projectile["c"])
-        speed = max(0.001, math.hypot(projectile["vr"], projectile["vc"]))
-        dr = projectile["vr"] / speed
-        dc = projectile["vc"] / speed
-        remaining = min(
-            6.0,
-            max(0.0, projectile["max_range"] - projectile["traveled"]),
-        )
-        landing = (r, c)
+        target_r = float(projectile.get("target_r", r))
+        target_c = float(projectile.get("target_c", c))
+        remaining = math.hypot(target_r - r, target_c - c)
+        if remaining <= 0.001:
+            dr, dc = 0.0, 0.0
+        else:
+            dr = (target_r - r) / remaining
+            dc = (target_c - c) / remaining
         step = 0.35
         distance = step
         while distance <= remaining:
             nr, nc = r + dr * distance, c + dc * distance
-            rr, cc = int(round(nr)), int(round(nc))
-            if is_wall(self.walls, rr, cc, self.gates):
-                break
-            landing = (nr, nc)
             if int(distance / step) % 2 == 0:
                 x = int(nc * CELL + MAZE_OX + CELL // 2)
                 y = int(nr * CELL + MAZE_OY + CELL // 2)
                 pygame.draw.circle(self.surf, (100, 255, 235), (x, y), 3)
             distance += step
-        lx = int(landing[1] * CELL + MAZE_OX + CELL // 2)
-        ly = int(landing[0] * CELL + MAZE_OY + CELL // 2)
+        lx = int(target_c * CELL + MAZE_OX + CELL // 2)
+        ly = int(target_r * CELL + MAZE_OY + CELL // 2)
         pygame.draw.circle(
             self.surf, (100, 255, 235),
             (lx, ly), max(6, CELL // 3), 2,
@@ -3397,6 +3532,177 @@ class Game:
             overlay, (0, 0, 0, 0), (x, y), max(CELL * 2, 36)
         )
         self.surf.blit(overlay, (0, 0))
+
+    @staticmethod
+    def _player_facing_angle(p):
+        return -math.degrees(math.atan2(
+            p.get("facing_r", 0.0), p.get("facing_c", 1.0)
+        ))
+
+    def _selected_held_item(self, p):
+        if p.get("role") == "hunter" and p.get("attack_anim", 0.0) > 0:
+            return "cleaver"
+
+        skills = p.get("skills", [])
+        if skills:
+            index = max(
+                0, min(int(p.get("selected_skill", 0)), len(skills) - 1)
+            )
+            skill = skills[index]
+            if skill in ("spear", "flash", "teleport", "trap"):
+                return skill
+
+        if p.get("role") == "hunter":
+            return "cleaver"
+
+        inp = self.mp_pending_input.get(p["id"], {})
+        if p["id"] == self.player_id and self.server is None:
+            inp = self.mp_local_input
+        if inp.get("e_held") and any(
+                not gen.completed and gen.is_adjacent(p["r"], p["c"])
+                for gen in self.mp_generators):
+            return "toolkit"
+        return None
+
+    def _draw_slash_animation(self, p, x, y):
+        remaining = max(0.0, p.get("attack_anim", 0.0))
+        progress = 1.0 - min(1.0, remaining / 0.25)
+        progress = 1.0 - (1.0 - progress) ** 3
+        base = math.atan2(
+            p.get("facing_r", 0.0), p.get("facing_c", 1.0)
+        )
+        current = base + math.radians(-82 + 152 * progress)
+        trail_start = max(base - math.radians(82), current - math.radians(78))
+
+        extent = max(64, CELL * 4)
+        overlay = pygame.Surface((extent, extent), pygame.SRCALPHA)
+        center = extent // 2
+        radius = CELL * 0.92
+        points = []
+        for i in range(13):
+            angle = trail_start + (current - trail_start) * i / 12
+            points.append((
+                center + math.cos(angle) * radius,
+                center + math.sin(angle) * radius,
+            ))
+        for i in range(1, len(points)):
+            alpha = int(40 + 175 * i / len(points))
+            width = max(2, int(CELL * (0.08 + 0.13 * i / len(points))))
+            pygame.draw.line(
+                overlay, (255, 225, 190, alpha),
+                points[i - 1], points[i], width,
+            )
+        tip = points[-1]
+        pygame.draw.circle(
+            overlay, (255, 246, 220, 225),
+            (int(tip[0]), int(tip[1])), max(2, CELL // 10),
+        )
+        self.surf.blit(overlay, (x - center, y - center))
+        return -math.degrees(current)
+
+    def _draw_held_item(self, p, x, y):
+        item_name = self._selected_held_item(p)
+        sprite = self.item_sprites.get(item_name)
+        if sprite is None:
+            return
+
+        facing_r = p.get("facing_r", 0.0)
+        facing_c = p.get("facing_c", 1.0)
+        angle = self._player_facing_angle(p)
+        if p.get("role") == "hunter" and p.get("attack_anim", 0.0) > 0:
+            angle = self._draw_slash_animation(p, x, y)
+
+        hand_x = x + int(facing_c * CELL * 0.42)
+        hand_y = y + int(facing_r * CELL * 0.42)
+        scale = 1.0 if item_name in ("spear", "cleaver") else 0.78
+        shown = pygame.transform.rotozoom(sprite, angle, scale)
+        self.surf.blit(shown, shown.get_rect(center=(hand_x, hand_y)))
+
+    def _draw_multiplayer_player(self, p):
+        if p.get("role") == "hunter":
+            color = (255, 66, 66)
+            role = "hunter"
+        else:
+            color = PLAYER_COLORS[p["id"] % len(PLAYER_COLORS)]
+            role = "runner"
+
+        x, y = cell_xy(p["r"], p["c"])
+        radius = max(7, int(CELL * 0.34))
+        if p.get("carried"):
+            carrier = next(
+                (
+                    hunter for hunter in self.mp_players
+                    if hunter.get("carrying_pid") == p["id"]
+                ),
+                None,
+            )
+            if carrier is not None:
+                x -= int(carrier.get("facing_c", 1.0) * CELL * 0.28)
+                y -= int(carrier.get("facing_r", 0.0) * CELL * 0.28)
+
+        shadow = pygame.Surface((radius * 4, radius * 3), pygame.SRCALPHA)
+        pygame.draw.ellipse(
+            shadow, (0, 0, 0, 125),
+            (radius, radius * 2, radius * 2, max(4, radius // 2)),
+        )
+        self.surf.blit(shadow, (x - radius * 2, y - radius * 2))
+
+        pygame.draw.circle(self.surf, (6, 10, 15), (x, y), radius + 5)
+        pygame.draw.circle(self.surf, color, (x, y), radius + 4, 2)
+
+        sprite = self.actor_sprites.get(role)
+        if sprite is None:
+            pygame.draw.circle(self.surf, color, (x, y), radius)
+        else:
+            angle = self._player_facing_angle(p)
+            scale = 1.0
+            if p.get("downed"):
+                angle -= 90
+                scale = 0.88
+            elif p.get("imprisoned") or p.get("carried"):
+                scale = 0.58
+            shown = pygame.transform.rotozoom(sprite, angle, scale)
+            if p.get("invisible_remaining", 0.0) > 0:
+                shown.set_alpha(105 if p["id"] == self.player_id else 45)
+            self.surf.blit(shown, shown.get_rect(center=(x, y)))
+
+        if not p.get("downed") and not p.get("imprisoned") \
+                and not p.get("carried"):
+            self._draw_held_item(p, x, y)
+
+        if p["id"] == self.player_id:
+            marker_r = radius + 8
+            for start in (20, 110, 200, 290):
+                pygame.draw.arc(
+                    self.surf, WHITE,
+                    (x - marker_r, y - marker_r, marker_r * 2, marker_r * 2),
+                    math.radians(start), math.radians(start + 38), 2,
+                )
+        if p.get("imprisoned"):
+            frac = max(
+                0.0, p.get("imprison_remaining", 0)
+            ) / FREEZING_POD_IMPRISON
+            arc_rect = pygame.Rect(
+                x - radius - 7, y - radius - 7,
+                (radius + 7) * 2, (radius + 7) * 2,
+            )
+            pygame.draw.arc(
+                self.surf, (255, 82, 82), arc_rect,
+                -math.pi / 2, -math.pi / 2 + math.tau * frac, 4,
+            )
+        if p.get("stun_remaining", 0.0) > 0:
+            for index in range(3):
+                angle = pygame.time.get_ticks() / 180.0 + index * math.tau / 3
+                sx = x + int(math.cos(angle) * (radius + 7))
+                sy = y + int(math.sin(angle) * (radius + 7))
+                pygame.draw.circle(self.surf, (255, 224, 74), (sx, sy), 3)
+        if p.get("trapped"):
+            pygame.draw.arc(
+                self.surf, (255, 128, 38),
+                (x - radius - 7, y - radius - 7,
+                 (radius + 7) * 2, (radius + 7) * 2),
+                0, math.tau, 3,
+            )
 
     def draw_mp_play(self):
         self.draw_maze()
@@ -3434,76 +3740,17 @@ class Game:
             None,
         )
 
-        # players
-        for p in self.mp_players:
+        # Draw carried runners last so they remain visible above their carrier.
+        players_to_draw = sorted(
+            self.mp_players, key=lambda player: bool(player.get("carried"))
+        )
+        for p in players_to_draw:
             if not p["alive"]:
                 continue
             if p["id"] != self.player_id \
                     and p.get("invisible_remaining", 0.0) > 0:
                 continue
-            # any player with role=hunter (DBD or ESCAPE-with-player-hunter) is red
-            if p.get("role") == "hunter":
-                color = (255, 60, 60)
-            else:
-                color = PLAYER_COLORS[p["id"] % len(PLAYER_COLORS)]
-            x, y   = cell_xy(p["r"], p["c"])
-            radius = int(CELL * 0.30)
-
-            # imprisoned or carried runners: draw smaller + a circle outline
-            if p.get("imprisoned") or p.get("carried"):
-                pygame.draw.circle(self.surf, color, (x, y), radius // 2)
-                if p.get("imprisoned"):
-                    pygame.draw.circle(self.surf, (200, 200, 200), (x, y), radius, 2)
-                    frac = max(0.0, p.get("imprison_remaining", 0)) / FREEZING_POD_IMPRISON
-                    arc_color = (255, 80, 80)
-                else:
-                    pygame.draw.circle(self.surf, (255, 220, 0), (x, y), radius, 2)
-                    frac = 1.0
-                    arc_color = (255, 220, 0)
-
-                # remaining-time arc
-                arc_rect = pygame.Rect(x - radius - 4, y - radius - 4,
-                                       (radius + 4) * 2, (radius + 4) * 2)
-                pygame.draw.arc(self.surf, arc_color, arc_rect,
-                                -math.pi / 2,
-                                -math.pi / 2 + math.tau * frac, 3)
-            elif p.get("downed"):
-                body = pygame.Rect(
-                    x - radius, y - radius // 2,
-                    radius * 2, max(4, radius),
-                )
-                pygame.draw.ellipse(self.surf, color, body)
-                pygame.draw.ellipse(self.surf, (255, 220, 0), body, 2)
-            else:
-                glow = pygame.Surface((radius * 4, radius * 4), pygame.SRCALPHA)
-                pygame.draw.circle(glow, (*color, 60),
-                                   (radius * 2, radius * 2), radius * 2)
-                self.surf.blit(glow, (x - radius * 2, y - radius * 2))
-                pygame.draw.circle(self.surf, color, (x, y), radius)
-
-            # own avatar: white outline
-            if p["id"] == self.player_id:
-                pygame.draw.circle(self.surf, WHITE, (x, y), radius + 2, 2)
-            if p.get("stun_remaining", 0.0) > 0:
-                pygame.draw.circle(
-                    self.surf, (255, 220, 0), (x, y), radius + 5, 3
-                )
-            if p.get("trapped"):
-                pygame.draw.circle(
-                    self.surf, (255, 120, 40), (x, y), radius + 7, 3
-                )
-            if p.get("attack_anim", 0.0) > 0:
-                tip_x = x + int(p.get("facing_c", 1.0) * CELL * 1.1)
-                tip_y = y + int(p.get("facing_r", 0.0) * CELL * 1.1)
-                pygame.draw.line(
-                    self.surf, (255, 245, 220), (x, y), (tip_x, tip_y), 5
-                )
-            if p["id"] == self.player_id:
-                tip_x = x + int(p.get("facing_c", 1.0) * CELL * 0.65)
-                tip_y = y + int(p.get("facing_r", 0.0) * CELL * 0.65)
-                pygame.draw.line(
-                    self.surf, WHITE, (x, y), (tip_x, tip_y), 2
-                )
+            self._draw_multiplayer_player(p)
 
         # bot hunter (escape mode only)
         if self.mp_mode == "escape" and self.hunter is not None:
@@ -3518,67 +3765,102 @@ class Game:
         if self.mp_mode != "dbd" or me is None:
             return
         skills = me.get("skills", [])
-        slot_size = 58
-        gap = 8
-        start_x = W - 24 - slot_size * 2 - gap
+        slot_size = 66
+        gap = 10
+        start_x = PANEL_X + PANEL_W - 20 - slot_size * 2 - gap
         y = H - slot_size - 24
         selected = min(
             self.mp_selected_skill, max(0, len(skills) - 1)
         )
+
+        section = pygame.Rect(
+            PANEL_X + 14, y - 36, PANEL_W - 28, slot_size + 50
+        )
+        pygame.draw.rect(
+            self.surf, (8, 13, 21), section, border_radius=6
+        )
+        pygame.draw.line(
+            self.surf, (25, 68, 85),
+            (section.x + 10, section.y),
+            (section.right - 10, section.y), 2,
+        )
+
+        selected_name = (
+            SKILL_NAMES[skills[selected]]
+            if skills and selected < len(skills)
+            else "NO SKILL"
+        )
+        title = self.font_tiny.render(selected_name, True, (198, 214, 222))
+        self.surf.blit(title, (section.x + 12, section.y + 8))
+
         for index in range(2):
             x = start_x + index * (slot_size + gap)
             rect = pygame.Rect(x, y, slot_size, slot_size)
             skill = skills[index] if index < len(skills) else None
             color = SKILL_COLORS.get(skill, (45, 45, 55))
-            pygame.draw.rect(self.surf, (20, 24, 34), rect)
+            shadow = rect.move(0, 4)
+            pygame.draw.rect(
+                self.surf, (2, 4, 7), shadow, border_radius=6
+            )
+            pygame.draw.rect(
+                self.surf, (13, 19, 28), rect, border_radius=6
+            )
             pygame.draw.rect(
                 self.surf, color, rect,
                 4 if index == selected and skill else 2,
+                border_radius=6,
             )
             if skill:
-                icon = self.font_sm.render(
-                    SKILL_NAMES[skill][:3], True, color
-                )
-                self.surf.blit(
-                    icon,
-                    (
-                        rect.centerx - icon.get_width() // 2,
-                        rect.centery - icon.get_height() // 2,
-                    ),
-                )
+                icon = self.skill_icons.get(skill)
+                if icon is not None:
+                    self.surf.blit(icon, icon.get_rect(center=rect.center))
+                else:
+                    fallback = self.font_sm.render(
+                        SKILL_NAMES[skill][:3], True, color
+                    )
+                    self.surf.blit(
+                        fallback, fallback.get_rect(center=rect.center)
+                    )
                 if skill == "trap" and me.get("trap_cooldown", 0.0) > 0:
+                    veil = pygame.Surface((slot_size, slot_size), pygame.SRCALPHA)
+                    veil.fill((0, 0, 0, 155))
+                    self.surf.blit(veil, rect)
                     cooldown = self.font_sm.render(
                         f"{me['trap_cooldown']:.1f}", True, WHITE
                     )
-                    self.surf.blit(
-                        cooldown,
-                        (
-                            rect.centerx - cooldown.get_width() // 2,
-                            rect.bottom - cooldown.get_height() - 2,
-                        ),
-                    )
-
-        hint = self.font_sm.render("F USE   WHEEL SWITCH", True, (170, 170, 170))
-        self.surf.blit(
-            hint,
-            (W - 24 - hint.get_width(), y - hint.get_height() - 6),
-        )
+                    self.surf.blit(cooldown, cooldown.get_rect(center=rect.center))
+            if index == selected and skill:
+                key = self.font_tiny.render("F", True, (8, 12, 18))
+                badge = pygame.Rect(rect.x + 5, rect.y + 5, 19, 19)
+                pygame.draw.rect(
+                    self.surf, color, badge, border_radius=4
+                )
+                self.surf.blit(key, key.get_rect(center=badge.center))
 
         effects = []
-        for key, label in (
-            ("speed_remaining", "SPRINT"),
-            ("invisible_remaining", "INVIS"),
-            ("phase_remaining", "PHASE"),
-            ("blind_remaining", "BLIND"),
+        for key, label, color in (
+            ("speed_remaining", "SPRINT", SKILL_COLORS["speed"]),
+            ("invisible_remaining", "INVIS", SKILL_COLORS["invisible"]),
+            ("phase_remaining", "PHASE", SKILL_COLORS["phase"]),
+            ("blind_remaining", "BLIND", (255, 200, 70)),
         ):
             if me.get(key, 0.0) > 0:
-                effects.append(f"{label} {me[key]:.1f}s")
-        if effects:
-            text = self.font_sm.render("  ".join(effects), True, WHITE)
-            self.surf.blit(
-                text,
-                (W - 24 - text.get_width(), y - hint.get_height() - text.get_height() - 12),
+                effects.append((f"{label} {me[key]:.1f}", color))
+        effect_y = section.y - 28
+        effect_x = PANEL_X + 18
+        for text_value, color in effects[:3]:
+            text = self.font_tiny.render(text_value, True, color)
+            chip = pygame.Rect(
+                effect_x, effect_y, text.get_width() + 16, 22
             )
+            pygame.draw.rect(
+                self.surf, (11, 17, 25), chip, border_radius=5
+            )
+            pygame.draw.rect(
+                self.surf, color, chip, 1, border_radius=5
+            )
+            self.surf.blit(text, (chip.x + 8, chip.y + 2))
+            effect_x = chip.right + 6
 
     def draw_skill_check(self):
         if self.mp_mode != "dbd":
@@ -3679,90 +3961,124 @@ class Game:
         )
 
     def draw_mp_panel(self):
-        pygame.draw.rect(self.surf, PANEL_BG, (PANEL_X, 0, PANEL_W, H))
-        pygame.draw.line(self.surf, (0, 120, 200), (PANEL_X, 0), (PANEL_X, H), 3)
+        self.surf.blit(self.panel_surface, (PANEL_X, 0))
+        pygame.draw.line(
+            self.surf, (26, 145, 174), (PANEL_X, 0), (PANEL_X, H), 3
+        )
+        pygame.draw.line(
+            self.surf, (78, 38, 42),
+            (PANEL_X + 3, 0), (PANEL_X + 3, H), 1,
+        )
 
         mode_label = {
             "escape": "ESCAPE",
             "dbd":    "DBD-MAZE",
         }.get(self.mp_mode, self.mp_mode.upper())
         role = "HOST" if self.server is not None else "CLIENT"
-        title = self.font_lg.render(mode_label, True, CYAN)
-        self.surf.blit(title, (PANEL_X + PANEL_W // 2 - title.get_width() // 2, 18))
+        brand = self.font_tiny.render("VOID // MAZE", True, (111, 137, 150))
+        self.surf.blit(brand, (PANEL_X + 22, 18))
+        title = self.font_med.render(mode_label, True, (93, 234, 220))
+        self.surf.blit(title, (PANEL_X + 20, 43))
+        role_text = self.font_tiny.render(role, True, (109, 132, 145))
+        self.surf.blit(
+            role_text, (PANEL_X + PANEL_W - role_text.get_width() - 20, 54)
+        )
+        pygame.draw.line(
+            self.surf, (27, 62, 77),
+            (PANEL_X + 18, 84), (PANEL_X + PANEL_W - 18, 84), 1,
+        )
 
         if self.mp_mode == "escape":
-            sub = self.font_sm.render(f"{role}  -  LEVEL {self.level}",
-                                      True, (160, 160, 160))
-            self.surf.blit(sub, (PANEL_X + PANEL_W // 2 - sub.get_width() // 2, 70))
+            sub = self.font_med.render(
+                f"LEVEL {self.level}", True, (235, 238, 239)
+            )
+            self.surf.blit(sub, (PANEL_X + 20, 102))
         else:
             mins = max(0, int(self.mp_match_timer)) // 60
             secs = max(0, int(self.mp_match_timer)) % 60
-            time_txt = self.font_lg.render(f"{mins:01d}:{secs:02d}",
-                                           True, (255, 220, 80))
-            self.surf.blit(time_txt,
-                           (PANEL_X + PANEL_W // 2 - time_txt.get_width() // 2, 60))
+            time_txt = self.font_lg.render(
+                f"{mins:01d}:{secs:02d}", True, (244, 204, 72)
+            )
+            self.surf.blit(time_txt, (PANEL_X + 20, 96))
             done = sum(1 for g in self.mp_generators if g.completed)
-            gen_txt = self.font_med.render(
-                f"GENERATORS  {done} / {len(self.mp_generators)}",
-                True, WHITE)
-            self.surf.blit(gen_txt,
-                           (PANEL_X + PANEL_W // 2 - gen_txt.get_width() // 2, 110))
+            gen_label = self.font_tiny.render(
+                f"GENERATORS  {done}/{len(self.mp_generators)}",
+                True, (195, 210, 218),
+            )
+            self.surf.blit(gen_label, (PANEL_X + 144, 103))
+            segment_w = 31
+            for index in range(max(1, len(self.mp_generators))):
+                segment = pygame.Rect(
+                    PANEL_X + 144 + index * (segment_w + 5),
+                    126, segment_w, 10,
+                )
+                fill = (75, 220, 124) if index < done else (32, 48, 59)
+                pygame.draw.rect(
+                    self.surf, fill, segment, border_radius=3
+                )
             status = "EXIT UNLOCKED" if self.exit_unlocked else "EXIT LOCKED"
-            scol = (80, 255, 80) if self.exit_unlocked else (255, 80, 80)
-            stxt = self.font_sm.render(status, True, scol)
-            self.surf.blit(stxt,
-                           (PANEL_X + PANEL_W // 2 - stxt.get_width() // 2, 152))
+            scol = (80, 230, 126) if self.exit_unlocked else (238, 78, 82)
+            stxt = self.font_tiny.render(status, True, scol)
+            self.surf.blit(stxt, (PANEL_X + 144, 144))
 
         # player list
-        y0 = 200
-        head = self.font_med.render("PLAYERS", True, WHITE)
-        self.surf.blit(head, (PANEL_X + 24, y0))
+        y0 = 190
+        head = self.font_tiny.render("MATCH STATUS", True, (121, 148, 161))
+        self.surf.blit(head, (PANEL_X + 20, y0))
+        pygame.draw.line(
+            self.surf, (28, 55, 67),
+            (PANEL_X + 20, y0 + 25),
+            (PANEL_X + PANEL_W - 20, y0 + 25), 1,
+        )
 
         for i, p in enumerate(self.mp_players):
             if p.get("role") == "hunter":
                 color    = (255, 60, 60)
-                role_tag = " [H]"
+                role_tag = "HUNTER"
             else:
                 color    = PLAYER_COLORS[p["id"] % len(PLAYER_COLORS)]
-                role_tag = ""
-            label = f"P{p['id'] + 1}{role_tag}" + \
-                    ("  (you)" if p["id"] == self.player_id else "")
+                role_tag = "RUNNER"
+            label = f"P{p['id'] + 1}" + \
+                    ("  YOU" if p["id"] == self.player_id else "")
             if not p["alive"]:
                 status = "ELIMINATED"
             elif p.get("imprisoned"):
-                status = f"IMPRISONED {p['imprison_remaining']:.0f}s"
+                status = f"FROZEN  {p['imprison_remaining']:.0f}s"
             elif p.get("carried"):
                 status = "CARRIED"
             elif p.get("downed"):
-                status = f"DOWNED {p['downed_remaining']:.1f}s"
+                status = f"DOWNED  {p['downed_remaining']:.1f}s"
             elif p.get("trapped"):
-                status = f"TRAPPED {p['trap_checks_remaining']}"
+                status = f"TRAPPED  {p['trap_checks_remaining']}"
             elif p.get("stun_remaining", 0.0) > 0:
-                status = f"STUNNED {p['stun_remaining']:.1f}s"
+                status = f"STUNNED  {p['stun_remaining']:.1f}s"
             else:
                 status = "ALIVE"
-            text = self.font_sm.render(f"{label}  -  {status}", True, color)
-            pygame.draw.rect(self.surf, color, (PANEL_X + 24, y0 + 50 + i * 36, 14, 14))
-            self.surf.blit(text, (PANEL_X + 46, y0 + 46 + i * 36))
-
-        hint_y = H - 220
-        if self.mp_mode == "escape":
-            hints = [
-                "WASD / ARROWS : MOVE",
-                "HOLD E : open gate",
-                "ESC : leave match",
-            ]
-        else:
-            hints = [
-                "WASD / ARROWS : MOVE",
-                "E : interact / pick up / drop",
-                "SPACE / CLICK : slash / skill check",
-                "F : use skill",
-                "ESC : leave match",
-            ]
-        for i, hint in enumerate(hints):
-            txt = self.font_sm.render(hint, True, (160, 160, 160))
-            self.surf.blit(txt, (PANEL_X + 24, hint_y + i * 28))
+            row = pygame.Rect(
+                PANEL_X + 16, y0 + 36 + i * 48, PANEL_W - 32, 40
+            )
+            pygame.draw.rect(
+                self.surf, (11, 18, 27), row, border_radius=5
+            )
+            pygame.draw.rect(
+                self.surf, color,
+                (row.x, row.y, 4, row.height), border_radius=2,
+            )
+            pygame.draw.circle(
+                self.surf, color, (row.x + 19, row.centery), 6
+            )
+            name_text = self.font_tiny.render(label, True, (228, 235, 238))
+            role_text = self.font_tiny.render(role_tag, True, color)
+            status_color = (
+                (104, 217, 139) if status == "ALIVE" else (229, 185, 82)
+            )
+            status_text = self.font_tiny.render(status, True, status_color)
+            self.surf.blit(name_text, (row.x + 32, row.y + 4))
+            self.surf.blit(role_text, (row.x + 32, row.y + 21))
+            self.surf.blit(
+                status_text,
+                (row.right - status_text.get_width() - 10, row.y + 12),
+            )
 
     def draw_mp_end(self):
         # render the maze + entities frozen behind the overlay
