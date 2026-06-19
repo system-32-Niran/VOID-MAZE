@@ -434,11 +434,11 @@ SKILL_ORB_MAX       = 6
 SKILL_ORB_INITIAL   = 3
 SKILL_NAMES = {
     "speed": "SPRINT",
-    "invisible": "INVIS",
-    "phase": "PHASE",
+    "invisible": "INVISIBLE",
+    "phase": "WALL THROUGH",
     "spear": "SPEAR",
-    "flash": "FLASH",
-    "teleport": "PEARL",
+    "flash": "BLIND BOMB",
+    "teleport": "TELE PEARL",
     "trap": "TRAP",
 }
 SKILL_COLORS = {
@@ -700,6 +700,7 @@ class Game:
         self.profile_name_input = self.profile.get("name", "")
         self.profile_editing = False
         self.daily_notice = ""
+        self.daily_claim_rects = []
         self.shop_tabs = ["BUY", "UPGRADE", "LOADOUT"]
         self.shop_tab = 0
         self.shop_index = 0
@@ -720,10 +721,19 @@ class Game:
             "PROFILE",
             "DAILY MISSIONS",
             "SHOP",
+            "HOW TO PLAY",
             "QUIT",
         ]
         self.menu_index   = 0
         self.menu_rects   = []   # populated each frame in draw_menu
+        self.help_topics = [
+            "ONLINE & BOTS",
+            "CLASSIC MAZE",
+            "DBD RUNNER",
+            "DBD HUNTER",
+        ]
+        self.help_index = 0
+        self.help_rects = []
 
         # lobby state
         self.lobby_options = ["HOST GAME", "JOIN GAME", "BACK"]
@@ -1163,11 +1173,18 @@ class Game:
             self.profile, mission_key, amount
         )
         if completed:
-            definition = progression.MISSION_DEFS[mission_key]
-            self.daily_notice = (
-                f"MISSION COMPLETE  +{definition['coins']} COINS"
-                f"  +{definition['xp']} XP"
-            )
+            self.daily_notice = "MISSION COMPLETE - OPEN DAILY MISSIONS"
+        self._save_profile()
+
+    def _claim_daily(self, mission_key):
+        if not progression.claim_mission_reward(
+                self.profile, mission_key):
+            return
+        definition = progression.MISSION_DEFS[mission_key]
+        self.daily_notice = (
+            f"CLAIMED  +{definition['coins']} COINS"
+            f"  +{definition['xp']} XP"
+        )
         self._save_profile()
 
     def _record_match_result(self):
@@ -1266,9 +1283,6 @@ class Game:
                 self.profile["owned_skills"].append(skill)
                 self.shop_notice = f"PURCHASED {SKILL_NAMES[skill]}"
         elif tab == "UPGRADE":
-            if not owned:
-                self.shop_notice = "BUY THIS SKILL FIRST"
-                return
             price = progression.skill_upgrade_price(skill, level)
             if price is None:
                 self.shop_notice = "MAX LEVEL"
@@ -1334,6 +1348,9 @@ class Game:
             self.shop_notice = ""
             self.shop_index = 0
             self.state = "shop"
+        elif choice == "HOW TO PLAY":
+            self.help_index = 0
+            self.state = "how_to_play"
         elif choice == "QUIT":
             pygame.quit()
             sys.exit()
@@ -1343,6 +1360,20 @@ class Game:
             if rect.collidepoint(pos):
                 self.menu_index = i
                 self.select_menu_option()
+                return True
+        return False
+
+    def handle_menu_hover(self, pos):
+        for index, rect in enumerate(self.menu_rects):
+            if rect.collidepoint(pos):
+                self.menu_index = index
+                return True
+        return False
+
+    def handle_help_hover(self, pos):
+        for index, rect in enumerate(self.help_rects):
+            if rect.collidepoint(pos):
+                self.help_index = index
                 return True
         return False
 
@@ -1785,54 +1816,326 @@ class Game:
     def draw_menu(self):
         self._draw_frontend_background(
             "MAIN TERMINAL",
-            "SURVIVAL OPERATIONS TERMINAL",
+            "SELECT AN OPERATION",
         )
-        title = self.font_xl.render("ENTER THE VOID", True, WHITE)
-        self.surf.blit(title, (70, 158))
-        accent = self.font_sm.render(
+        outer = pygame.Rect(48, 132, W - 96, H - 190)
+        pygame.draw.rect(self.surf, (7, 14, 22), outer, border_radius=6)
+        pygame.draw.rect(
+            self.surf, (29, 70, 83), outer, 2, border_radius=6
+        )
+        nav_w = max(330, min(430, int(outer.width * 0.42)))
+        divider_x = outer.x + nav_w
+        pygame.draw.line(
+            self.surf, (26, 64, 78),
+            (divider_x, outer.y + 24),
+            (divider_x, outer.bottom - 24), 2,
+        )
+
+        title = self.font_lg.render("VOID OPERATIONS", True, WHITE)
+        self.surf.blit(title, (outer.x + 28, outer.y + 24))
+        accent = self.font_tiny.render(
             "ASYMMETRIC HORROR // MAZE SURVIVAL",
             True, (235, 75, 78),
         )
-        self.surf.blit(accent, (74, 230))
+        self.surf.blit(accent, (outer.x + 31, outer.y + 86))
 
         self.menu_rects = []
-        column_x = 70
-        start_y = 300
-        width = min(470, W // 3)
-        height = 52
+        column_x = outer.x + 28
+        start_y = outer.y + 132
+        width = nav_w - 56
+        height = 48
+        option_count = len(self.menu_options)
+        gap = max(
+            6,
+            min(
+                14,
+                (outer.height - 160 - height * option_count)
+                // max(1, option_count - 1),
+            ),
+        )
         for i, label in enumerate(self.menu_options):
-            rect = pygame.Rect(column_x, start_y + i * 62, width, height)
+            rect = pygame.Rect(
+                column_x, start_y + i * (height + gap), width, height
+            )
             self.menu_rects.append(rect)
             self._draw_menu_option(label, rect, i == self.menu_index)
 
-        panel = pygame.Rect(W - 520, 155, 440, 500)
-        pygame.draw.rect(self.surf, (8, 15, 23), panel, border_radius=6)
-        pygame.draw.rect(
-            self.surf, (29, 70, 83), panel, 2, border_radius=6
+        detail_x = divider_x + 32
+        detail_w = outer.right - detail_x - 28
+        selected = self.menu_options[self.menu_index]
+        descriptions = {
+            "SINGLE PLAYER": (
+                "SOLO EXPEDITION",
+                "Enter a shifting maze and survive the hunt alone.",
+            ),
+            "MULTIPLAYER": (
+                "NETWORK SESSION",
+                "Host or join an asymmetric DBD-Maze match.",
+            ),
+            "PROFILE": (
+                "OPERATIVE PROFILE",
+                "Change your name and review persistent progression.",
+            ),
+            "DAILY MISSIONS": (
+                "DAILY OPERATIONS",
+                "Complete objectives, then claim their rewards manually.",
+            ),
+            "SHOP": (
+                "SKILL TERMINAL",
+                "Buy loadout skills or upgrade skills found through orbs.",
+            ),
+            "HOW TO PLAY": (
+                "FIELD MANUAL",
+                "Learn online setup, maze basics, and both DBD-Maze roles.",
+            ),
+            "QUIT": (
+                "DISCONNECT",
+                "Close the current VOID MAZE session.",
+            ),
+        }
+        detail_title, detail_description = descriptions[selected]
+        label = self.font_tiny.render(
+            "SELECTED OPERATION", True, (109, 137, 151)
         )
-        hunter = self.actor_sprites.get("hunter")
-        runner = self.actor_sprites.get("runner")
-        if hunter is not None:
-            shown = pygame.transform.smoothscale(hunter, (190, 190))
-            self.surf.blit(shown, shown.get_rect(center=(panel.x + 135, panel.y + 175)))
-        if runner is not None:
-            shown = pygame.transform.smoothscale(runner, (135, 135))
-            self.surf.blit(shown, shown.get_rect(center=(panel.x + 315, panel.y + 205)))
+        self.surf.blit(label, (detail_x, outer.y + 34))
+        heading_font = self.font_xl
+        if heading_font.size(detail_title)[0] > detail_w:
+            heading_font = self.font_lg
+        detail_heading = heading_font.render(
+            detail_title, True, (86, 234, 220)
+        )
+        self.surf.blit(detail_heading, (detail_x, outer.y + 68))
+        description = self.font_sm.render(
+            detail_description, True, (183, 201, 210)
+        )
+        self.surf.blit(description, (detail_x, outer.y + 128))
+        pygame.draw.line(
+            self.surf, (26, 64, 78),
+            (detail_x, outer.y + 178),
+            (detail_x + detail_w, outer.y + 178), 1,
+        )
+
+        profile_name = self.profile.get("name") or "UNNAMED OPERATIVE"
+        status_rows = [
+            ("OPERATIVE", profile_name),
+            ("LEVEL", str(self.profile["level"])),
+            ("CURRENCY", f"{self.profile['coins']} C"),
+        ]
+        for index, (row_label, value) in enumerate(status_rows):
+            y = outer.y + 208 + index * 54
+            row_name = self.font_tiny.render(
+                row_label, True, (109, 137, 151)
+            )
+            row_value = self.font_med.render(value, True, WHITE)
+            self.surf.blit(row_name, (detail_x, y))
+            self.surf.blit(
+                row_value,
+                (detail_x + detail_w - row_value.get_width(), y - 6),
+            )
+            pygame.draw.line(
+                self.surf, (18, 42, 53),
+                (detail_x, y + 30), (detail_x + detail_w, y + 30), 1,
+            )
+
         mission_states = self.profile["daily"]["missions"]
-        complete = sum(1 for state in mission_states.values() if state["claimed"])
-        daily = self.font_med.render(
-            f"DAILY OPERATIONS  {complete}/{len(mission_states)}",
+        ready = sum(
+            1 for key, state in mission_states.items()
+            if not state["claimed"]
+            and state["progress"] >= progression.MISSION_DEFS[key]["target"]
+        )
+        claimed = sum(1 for state in mission_states.values() if state["claimed"])
+        daily_label = self.font_tiny.render(
+            "DAILY STATUS", True, (109, 137, 151)
+        )
+        daily_value = self.font_med.render(
+            f"{ready} READY  //  {claimed}/{len(mission_states)} CLAIMED",
             True, (240, 205, 71),
         )
-        self.surf.blit(daily, (panel.x + 28, panel.y + 330))
+        daily_y = outer.bottom - 112
+        self.surf.blit(daily_label, (detail_x, daily_y))
+        self.surf.blit(daily_value, (detail_x, daily_y + 25))
+
         loadout = ", ".join(
             SKILL_NAMES[skill]
             for skill in self.profile["equipped_skills"]
         ) or "EMPTY"
-        loadout_text = self.font_sm.render(
-            f"LOADOUT  {loadout}", True, (174, 196, 206)
+        loadout_label = self.font_tiny.render(
+            "PERMANENT SKILL", True, (109, 137, 151)
         )
-        self.surf.blit(loadout_text, (panel.x + 28, panel.y + 382))
+        loadout_text = self.font_sm.render(
+            loadout, True, (174, 196, 206)
+        )
+        self.surf.blit(loadout_label, (detail_x, outer.bottom - 54))
+        self.surf.blit(
+            loadout_text,
+            (
+                detail_x + detail_w - loadout_text.get_width(),
+                outer.bottom - 59,
+            ),
+        )
+
+    def draw_how_to_play(self):
+        self._draw_frontend_background(
+            "HOW TO PLAY",
+            "MOVE THE CURSOR OVER A TOPIC TO READ IT",
+        )
+        panel = pygame.Rect(48, 132, W - 96, H - 190)
+        pygame.draw.rect(self.surf, (7, 14, 22), panel, border_radius=6)
+        pygame.draw.rect(
+            self.surf, (29, 70, 83), panel, 2, border_radius=6
+        )
+
+        sidebar_w = 270
+        divider_x = panel.x + sidebar_w
+        pygame.draw.line(
+            self.surf, (26, 64, 78),
+            (divider_x, panel.y + 24),
+            (divider_x, panel.bottom - 24), 2,
+        )
+        heading = self.font_med.render("FIELD MANUAL", True, WHITE)
+        self.surf.blit(heading, (panel.x + 28, panel.y + 28))
+
+        self.help_rects = []
+        for index, topic in enumerate(self.help_topics):
+            rect = pygame.Rect(
+                panel.x + 24, panel.y + 112 + index * 68,
+                sidebar_w - 48, 50,
+            )
+            self.help_rects.append(rect)
+            self._draw_menu_option(
+                topic, rect, index == self.help_index
+            )
+
+        guides = [
+            (
+                "ONLINE & BOTS",
+                "PLAY TOGETHER OR FILL THE MATCH WITH AI",
+                [
+                    ("RADMIN VPN", [
+                        "1. Install Radmin VPN on every computer.",
+                        "2. Join the same Radmin network.",
+                        "3. The host selects MULTIPLAYER > HOST GAME.",
+                        "4. Other players select JOIN GAME and enter the",
+                        "   host's Radmin IP address. The game uses port 5555.",
+                        "5. Allow Python or VOID MAZE through Windows Firewall.",
+                    ]),
+                    ("PLAY WITH BOTS", [
+                        "Host a DBD-Maze match and change BOT RUNNERS with",
+                        "the arrow buttons in the ready room, then start.",
+                        "Bots can repair, rescue, hunt, use gates, and use skills.",
+                    ]),
+                ],
+            ),
+            (
+                "CLASSIC MAZE",
+                "FIND THE EXIT BEFORE THE HUNTER FINDS YOU",
+                [
+                    ("OBJECTIVE", [
+                        "Move through the maze and reach the exit tile.",
+                        "Each completed maze advances the level and score.",
+                    ]),
+                    ("CONTROLS", [
+                        "WASD or Arrow Keys: move.",
+                        "Hold E beside a gate: open or close the gate.",
+                        "Portals teleport you when the mode enables them.",
+                    ]),
+                    ("SURVIVAL", [
+                        "Do not let the hunter reach your tile.",
+                        "Use gates, portals, and alternate routes to gain distance.",
+                    ]),
+                ],
+            ),
+            (
+                "DBD RUNNER",
+                "REPAIR, RESCUE, AND ESCAPE",
+                [
+                    ("OBJECTIVE", [
+                        "Repair all generators to unlock the exit.",
+                        "Hold E beside a generator. Multiple runners repair faster.",
+                        "Press SPACE inside the highlighted skill-check zone.",
+                    ]),
+                    ("TEAM PLAY", [
+                        "Hold E beside a freezing pod to rescue a trapped runner.",
+                        "Split between generators and rescues when the hunter camps.",
+                        "Escaping is individual; other runners continue the match.",
+                    ]),
+                    ("SKILLS", [
+                        "Press F to use the selected skill.",
+                        "Use the mouse wheel to switch between two skill slots.",
+                        "Orb skills are temporary and disappear after use.",
+                    ]),
+                ],
+            ),
+            (
+                "DBD HUNTER",
+                "DOWN, CARRY, AND FREEZE EVERY RUNNER",
+                [
+                    ("COMBAT", [
+                        "Aim with the mouse and press SPACE or Left Click to slash.",
+                        "A hit downs a runner temporarily; touching is not enough.",
+                    ]),
+                    ("CAPTURE", [
+                        "Press E near a downed runner to pick them up.",
+                        "Carry them to a freezing pod and press E to imprison them.",
+                        "Press E again while carrying to put the runner down.",
+                    ]),
+                    ("PRESSURE", [
+                        "Press F to use the selected skill or place a trap.",
+                        "Guard active generators and intercept rescue routes.",
+                        "The hunter wins when no runner can continue or time expires.",
+                    ]),
+                ],
+            ),
+        ]
+
+        title, subtitle, sections = guides[self.help_index]
+        content_x = divider_x + 34
+        content_right = panel.right - 28
+        title_text = self.font_xl.render(title, True, (86, 234, 220))
+        self.surf.blit(title_text, (content_x, panel.y + 28))
+        subtitle_text = self.font_tiny.render(
+            subtitle, True, (235, 75, 78)
+        )
+        self.surf.blit(subtitle_text, (content_x, panel.y + 88))
+        pygame.draw.line(
+            self.surf, (26, 64, 78),
+            (content_x, panel.y + 122),
+            (content_right, panel.y + 122), 1,
+        )
+
+        y = panel.y + 146
+        for section_title, lines in sections:
+            section_text = self.font_sm.render(
+                section_title, True, (239, 205, 71)
+            )
+            self.surf.blit(section_text, (content_x, y))
+            y += 31
+            for line in lines:
+                words = line.strip().split()
+                wrapped = []
+                current = ""
+                max_width = content_right - content_x - 8
+                for word in words:
+                    candidate = f"{current} {word}".strip()
+                    if current and self.font_sm.size(candidate)[0] > max_width:
+                        wrapped.append(current)
+                        current = word
+                    else:
+                        current = candidate
+                if current:
+                    wrapped.append(current)
+                for wrapped_line in wrapped:
+                    line_text = self.font_sm.render(
+                        wrapped_line, True, (190, 207, 215)
+                    )
+                    self.surf.blit(line_text, (content_x + 8, y))
+                    y += 26
+            y += 14
+
+        back = self.font_tiny.render(
+            "ESC  BACK TO MAIN TERMINAL", True, (109, 137, 151)
+        )
+        self.surf.blit(back, (panel.x + 28, panel.bottom - 38))
 
     def draw_profile(self):
         self._draw_frontend_background(
@@ -1910,15 +2213,22 @@ class Game:
     def draw_daily(self):
         self._draw_frontend_background(
             "DAILY MISSIONS",
-            "DAILY OPERATIONS",
+            "CLICK A COMPLETED MISSION TO CLAIM ITS REWARD",
         )
+        self.daily_claim_rects = []
         start_y = 180
         for index, (key, definition) in enumerate(
                 progression.MISSION_DEFS.items()):
             state = self.profile["daily"]["missions"][key]
             card = pygame.Rect(W // 2 - 430, start_y + index * 140, 860, 112)
             pygame.draw.rect(self.surf, (8, 16, 24), card, border_radius=6)
-            color = (80, 224, 127) if state["claimed"] else (61, 210, 198)
+            progress = min(state["progress"], definition["target"])
+            ready = progress >= definition["target"] and not state["claimed"]
+            color = (
+                (80, 224, 127) if state["claimed"]
+                else (239, 205, 71) if ready
+                else (61, 210, 198)
+            )
             pygame.draw.rect(self.surf, color, card, 2, border_radius=6)
             label = self.font_med.render(definition["label"], True, WHITE)
             self.surf.blit(label, (card.x + 28, card.y + 18))
@@ -1927,10 +2237,15 @@ class Game:
                 True, (239, 205, 71),
             )
             self.surf.blit(reward, (card.x + 28, card.y + 61))
-            progress = min(state["progress"], definition["target"])
-            status = "CLAIMED" if state["claimed"] else \
-                f"{progress}/{definition['target']}"
-            status_text = self.font_med.render(status, True, color)
+            if state["claimed"]:
+                status = "CLAIMED"
+            elif ready:
+                status = "CLICK TO CLAIM"
+                self.daily_claim_rects.append((key, card))
+            else:
+                status = f"{progress}/{definition['target']}"
+            status_font = self.font_sm if ready else self.font_med
+            status_text = status_font.render(status, True, color)
             self.surf.blit(
                 status_text,
                 (card.right - status_text.get_width() - 28, card.y + 37),
@@ -1998,17 +2313,18 @@ class Game:
                 self.surf.blit(
                     shown, shown.get_rect(center=(rect.x + 32, rect.centery))
                 )
-            label = self.font_sm.render(SKILL_NAMES[skill], True, WHITE)
+            name_font = (
+                self.font_tiny
+                if len(SKILL_NAMES[skill]) > 9 else self.font_sm
+            )
+            label = name_font.render(SKILL_NAMES[skill], True, WHITE)
             self.surf.blit(label, (rect.x + 61, rect.y + 13))
             tab = self.shop_tabs[self.shop_tab]
             if tab == "BUY":
                 state = "PURCHASED" if owned \
                     else f"{progression.SKILL_PRICES[skill]} C"
             elif tab == "UPGRADE":
-                state = (
-                    f"LEVEL {self.profile['skill_levels'].get(skill, 1)}"
-                    if owned else "LOCKED"
-                )
+                state = f"LEVEL {self.profile['skill_levels'].get(skill, 1)}"
             else:
                 state = (
                     "EQUIPPED"
@@ -2017,13 +2333,13 @@ class Game:
                 )
             state_text = self.font_tiny.render(
                 state, True,
-                color if owned else (122, 143, 153),
+                color if owned or tab == "UPGRADE" else (122, 143, 153),
             )
             self.surf.blit(state_text, (rect.x + 61, rect.y + 46))
 
         skill = self._shop_selected_skill()
         if skill is not None:
-            detail = pygame.Rect(W - 555, 230, 480, 390)
+            detail = pygame.Rect(W - 555, 220, 480, 430)
             pygame.draw.rect(self.surf, (8, 16, 24), detail, border_radius=6)
             pygame.draw.rect(
                 self.surf, SKILL_COLORS[skill], detail, 2, border_radius=6
@@ -2032,7 +2348,11 @@ class Game:
             if icon is not None:
                 shown = pygame.transform.smoothscale(icon, (96, 96))
                 self.surf.blit(shown, (detail.x + 28, detail.y + 30))
-            title = self.font_lg.render(SKILL_NAMES[skill], True, WHITE)
+            title_font = (
+                self.font_med
+                if len(SKILL_NAMES[skill]) > 10 else self.font_lg
+            )
+            title = title_font.render(SKILL_NAMES[skill], True, WHITE)
             self.surf.blit(title, (detail.x + 145, detail.y + 34))
             level = self.profile["skill_levels"].get(skill, 1)
             level_text = self.font_sm.render(
@@ -2043,10 +2363,12 @@ class Game:
             description = self.font_sm.render(
                 SKILL_DESCRIPTIONS[skill], True, (164, 184, 194)
             )
-            self.surf.blit(description, (detail.x + 28, detail.y + 150))
+            self.surf.blit(description, (detail.x + 28, detail.y + 145))
             for index, stat in enumerate(self._skill_stats(skill, level)):
                 text = self.font_sm.render(stat, True, (219, 226, 228))
-                self.surf.blit(text, (detail.x + 32, detail.y + 205 + index * 36))
+                self.surf.blit(
+                    text, (detail.x + 32, detail.y + 190 + index * 31)
+                )
 
             tab = self.shop_tabs[self.shop_tab]
             if tab == "BUY":
@@ -2054,13 +2376,10 @@ class Game:
                     self.profile["owned_skills"] else "PURCHASE"
             elif tab == "UPGRADE":
                 price = progression.skill_upgrade_price(skill, level)
-                if skill not in self.profile["owned_skills"]:
-                    action = "BUY SKILL FIRST"
-                else:
-                    action = (
-                        "MAX LEVEL"
-                        if price is None else f"UPGRADE {price} C"
-                    )
+                action = (
+                    "MAX LEVEL"
+                    if price is None else f"UPGRADE {price} C"
+                )
             else:
                 equipped = skill in self.profile["equipped_skills"]
                 action = "UNEQUIP" if equipped else "EQUIP"
@@ -2072,10 +2391,7 @@ class Game:
                 (tab == "BUY" and skill in self.profile["owned_skills"])
                 or (
                     tab == "UPGRADE"
-                    and (
-                    skill not in self.profile["owned_skills"]
-                    or progression.skill_upgrade_price(skill, level) is None
-                    )
+                    and progression.skill_upgrade_price(skill, level) is None
                 )
             )
             action_color = (
@@ -3602,8 +3918,6 @@ class Game:
 
     @staticmethod
     def _skill_level(p, skill):
-        if skill in p.get("temporary_skills", []):
-            return 1
         return max(1, int(p.get("skill_levels", {}).get(skill, 1)))
 
     def _skill_max_charges(self, p, skill):
@@ -4805,8 +5119,8 @@ class Game:
         effects = []
         for key, label, color in (
             ("speed_remaining", "SPRINT", SKILL_COLORS["speed"]),
-            ("invisible_remaining", "INVIS", SKILL_COLORS["invisible"]),
-            ("phase_remaining", "PHASE", SKILL_COLORS["phase"]),
+            ("invisible_remaining", "INVISIBLE", SKILL_COLORS["invisible"]),
+            ("phase_remaining", "WALL THROUGH", SKILL_COLORS["phase"]),
             ("blind_remaining", "BLIND", (255, 200, 70)),
         ):
             if me.get(key, 0.0) > 0:
@@ -5219,7 +5533,8 @@ class Game:
                             self.state = "lobby"
                         elif self.state == "lobby":
                             self.state = "menu"
-                        elif self.state in ("profile", "daily", "shop"):
+                        elif self.state in (
+                                "profile", "daily", "shop", "how_to_play"):
                             if self.state == "profile":
                                 self.profile_name_input = self.profile.get(
                                     "name", ""
@@ -5248,6 +5563,16 @@ class Game:
                             self.menu_index = (self.menu_index + 1) % len(self.menu_options)
                         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                             self.select_menu_option()
+
+                    elif self.state == "how_to_play":
+                        if event.key in (pygame.K_UP, pygame.K_w):
+                            self.help_index = (
+                                self.help_index - 1
+                            ) % len(self.help_topics)
+                        elif event.key in (pygame.K_DOWN, pygame.K_s):
+                            self.help_index = (
+                                self.help_index + 1
+                            ) % len(self.help_topics)
 
                     elif self.state == "profile":
                         if event.key == pygame.K_RETURN:
@@ -5374,6 +5699,12 @@ class Game:
                         self.reset()
                         self.state = "play"
 
+                if event.type == pygame.MOUSEMOTION:
+                    if self.state == "menu":
+                        self.handle_menu_hover(event.pos)
+                    elif self.state == "how_to_play":
+                        self.handle_help_hover(event.pos)
+
                 # mouse clicks
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self._register_click(event.pos)
@@ -5388,6 +5719,16 @@ class Game:
                         elif self.profile_save_rect is not None \
                                 and self.profile_save_rect.collidepoint(event.pos):
                             self._commit_profile_name()
+                    elif self.state == "daily":
+                        for mission_key, rect in self.daily_claim_rects:
+                            if rect.collidepoint(event.pos):
+                                self._claim_daily(mission_key)
+                                break
+                    elif self.state == "how_to_play":
+                        for index, rect in enumerate(self.help_rects):
+                            if rect.collidepoint(event.pos):
+                                self.help_index = index
+                                break
                     elif self.state == "shop":
                         tab_clicked = False
                         for index, rect in enumerate(self.shop_tab_rects):
@@ -5613,6 +5954,9 @@ class Game:
 
             elif self.state == "daily":
                 self.draw_daily()
+
+            elif self.state == "how_to_play":
+                self.draw_how_to_play()
 
             elif self.state == "shop":
                 self.draw_shop()

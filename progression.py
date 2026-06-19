@@ -159,9 +159,18 @@ def add_mission_progress(profile, mission_key, amount=1):
     if definition is None or state is None or state["claimed"]:
         return False
 
+    previous = state["progress"]
     state["progress"] = min(
         definition["target"], state["progress"] + max(0, int(amount))
     )
+    return previous < definition["target"] <= state["progress"]
+
+
+def claim_mission_reward(profile, mission_key):
+    definition = MISSION_DEFS.get(mission_key)
+    state = profile["daily"]["missions"].get(mission_key)
+    if definition is None or state is None or state["claimed"]:
+        return False
     if state["progress"] < definition["target"]:
         return False
 
