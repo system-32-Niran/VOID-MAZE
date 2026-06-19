@@ -36,73 +36,102 @@ def polygon(draw, points, fill, outline=(5, 8, 14, 255), width=4):
 def draw_hunter(image, ox=0, oy=0):
     draw = ImageDraw.Draw(image)
     cx, cy = ox + 64, oy + 64
-    image.alpha_composite(glow_layer(image.size, (cx, cy), 48, (225, 35, 45, 38)))
+    image.alpha_composite(glow_layer(image.size, (cx, cy), 51, (230, 30, 42, 32)))
 
-    polygon(draw, [(cx - 38, cy - 20), (cx + 17, cy - 31),
-                   (cx + 37, cy), (cx + 13, cy + 30),
-                   (cx - 39, cy + 20)], (28, 31, 39, 255))
-    polygon(draw, [(cx - 27, cy - 22), (cx + 17, cy - 22),
-                   (cx + 29, cy), (cx + 17, cy + 22),
-                   (cx - 27, cy + 20)], (48, 51, 59, 255), width=3)
-    polygon(draw, [(cx - 42, cy - 22), (cx - 17, cy - 30),
-                   (cx - 4, cy - 13), (cx - 27, cy - 3)],
-            (20, 22, 29, 255), width=3)
-    polygon(draw, [(cx - 42, cy + 22), (cx - 17, cy + 30),
-                   (cx - 4, cy + 13), (cx - 27, cy + 3)],
-            (20, 22, 29, 255), width=3)
-
-    draw.ellipse((cx + 8, cy - 24, cx + 47, cy + 24),
-                 fill=(174, 177, 168, 255), outline=(8, 10, 15, 255), width=4)
-    draw.polygon([(cx + 30, cy - 18), (cx + 47, cy),
-                  (cx + 30, cy + 18)], fill=(119, 124, 122, 255))
-    draw.line((cx + 21, cy - 11, cx + 39, cy - 7),
-              fill=(255, 60, 65, 255), width=4)
-    draw.line((cx + 21, cy + 11, cx + 39, cy + 7),
-              fill=(255, 60, 65, 255), width=4)
-    draw.line((cx - 12, cy - 21, cx + 4, cy + 19),
-              fill=(130, 24, 31, 255), width=7)
-    draw.ellipse((cx - 2, cy - 34, cx + 15, cy - 18),
-                 fill=(64, 67, 72, 255), outline=(8, 10, 15, 255), width=3)
-    draw.ellipse((cx - 2, cy + 18, cx + 15, cy + 34),
-                 fill=(64, 67, 72, 255), outline=(8, 10, 15, 255), width=3)
+    polygon(
+        draw,
+        [(cx - 51, cy), (cx - 15, cy - 42), (cx + 43, cy - 28),
+         (cx + 52, cy), (cx + 43, cy + 28), (cx - 15, cy + 42)],
+        (16, 18, 24, 255),
+        width=6,
+    )
+    polygon(
+        draw,
+        [(cx - 18, cy - 33), (cx + 33, cy - 24),
+         (cx + 42, cy), (cx + 33, cy + 24), (cx - 18, cy + 33)],
+        (50, 12, 18, 255),
+        width=4,
+    )
+    draw.ellipse(
+        (cx + 5, cy - 31, cx + 58, cy + 31),
+        fill=(202, 34, 43, 255),
+        outline=(6, 7, 10, 255),
+        width=6,
+    )
+    draw.polygon(
+        [(cx + 31, cy - 24), (cx + 58, cy), (cx + 31, cy + 24)],
+        fill=(84, 9, 14, 255),
+    )
+    draw.line(
+        (cx + 27, cy - 10, cx + 49, cy - 6),
+        fill=(255, 235, 218, 255),
+        width=5,
+    )
+    draw.line(
+        (cx + 27, cy + 10, cx + 49, cy + 6),
+        fill=(255, 235, 218, 255),
+        width=5,
+    )
+    draw.ellipse(
+        (cx - 8, cy - 48, cx + 18, cy - 24),
+        fill=(34, 37, 43, 255),
+        outline=(5, 7, 10, 255),
+        width=4,
+    )
+    draw.ellipse(
+        (cx - 8, cy + 24, cx + 18, cy + 48),
+        fill=(34, 37, 43, 255),
+        outline=(5, 7, 10, 255),
+        width=4,
+    )
 
 
 def draw_runner(image, ox=0, oy=0):
     draw = ImageDraw.Draw(image)
     cx, cy = ox + 64, oy + 64
-    image.alpha_composite(glow_layer(image.size, (cx, cy), 45, (35, 220, 206, 35)))
+    image.alpha_composite(glow_layer(image.size, (cx, cy), 38, (35, 224, 211, 30)))
 
-    polygon(draw, [(cx - 37, cy - 15), (cx + 5, cy - 29),
-                   (cx + 35, cy - 13), (cx + 38, cy + 13),
-                   (cx + 5, cy + 29), (cx - 37, cy + 15)],
-            (20, 92, 104, 255))
-    polygon(draw, [(cx - 23, cy - 18), (cx + 12, cy - 22),
-                   (cx + 28, cy), (cx + 12, cy + 22),
-                   (cx - 23, cy + 18)], (29, 139, 143, 255), width=3)
-    polygon(draw, [(cx - 43, cy - 20), (cx - 18, cy - 27),
-                   (cx - 7, cy - 12), (cx - 29, cy - 4)],
-            (23, 47, 57, 255), width=3)
-    polygon(draw, [(cx - 43, cy + 20), (cx - 18, cy + 27),
-                   (cx - 7, cy + 12), (cx - 29, cy + 4)],
-            (23, 47, 57, 255), width=3)
-
-    draw.ellipse((cx + 10, cy - 22, cx + 46, cy + 22),
-                 fill=(206, 170, 137, 255), outline=(7, 11, 16, 255), width=4)
-    draw.pieslice((cx + 7, cy - 25, cx + 44, cy + 25),
-                  120, 240, fill=(29, 35, 43, 255))
-    draw.line((cx + 27, cy - 7, cx + 42, cy - 4),
-              fill=(207, 243, 240, 255), width=3)
-    draw.line((cx + 27, cy + 7, cx + 42, cy + 4),
-              fill=(207, 243, 240, 255), width=3)
-    draw.rounded_rectangle((cx - 34, cy - 17, cx - 12, cy + 17),
-                           radius=5, fill=(49, 61, 68, 255),
-                           outline=(8, 12, 18, 255), width=3)
-    draw.line((cx - 8, cy - 19, cx + 5, cy + 18),
-              fill=(230, 181, 55, 255), width=5)
-    draw.ellipse((cx - 1, cy - 35, cx + 15, cy - 19),
-                 fill=(45, 92, 98, 255), outline=(8, 12, 18, 255), width=3)
-    draw.ellipse((cx - 1, cy + 19, cx + 15, cy + 35),
-                 fill=(45, 92, 98, 255), outline=(8, 12, 18, 255), width=3)
+    draw.ellipse(
+        (cx - 37, cy - 30, cx + 34, cy + 30),
+        fill=(23, 161, 164, 255),
+        outline=(5, 10, 14, 255),
+        width=6,
+    )
+    draw.ellipse(
+        (cx + 2, cy - 25, cx + 46, cy + 25),
+        fill=(225, 237, 233, 255),
+        outline=(5, 10, 14, 255),
+        width=5,
+    )
+    draw.line(
+        (cx + 18, cy - 18, cx + 38, cy - 12),
+        fill=(47, 219, 205, 255),
+        width=5,
+    )
+    draw.line(
+        (cx + 18, cy + 18, cx + 38, cy + 12),
+        fill=(47, 219, 205, 255),
+        width=5,
+    )
+    draw.rounded_rectangle(
+        (cx - 43, cy - 22, cx - 16, cy + 22),
+        radius=7,
+        fill=(229, 181, 45, 255),
+        outline=(5, 10, 14, 255),
+        width=5,
+    )
+    draw.line(
+        (cx - 17, cy - 24, cx + 2, cy + 24),
+        fill=(245, 211, 103, 255),
+        width=5,
+    )
+    for side in (-1, 1):
+        draw.ellipse(
+            (cx - 3, cy + side * 31 - 9, cx + 12, cy + side * 31 + 9),
+            fill=(20, 75, 83, 255),
+            outline=(5, 10, 14, 255),
+            width=3,
+        )
 
 
 def draw_cleaver(draw, box):

@@ -11,9 +11,11 @@ from collections import deque
 
 import network
 import maps.map_dbd
+import progression
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSET_DIR = os.path.join(BASE_DIR, "assets")
+PROFILE_PATH = os.path.join(BASE_DIR, "save", "profile.json")
 
 # Place the borderless window at the top-left of the primary display.
 # Must be set BEFORE pygame.init() / display.set_mode for SDL to pick it up.
@@ -421,6 +423,7 @@ TRAP_CHECK_COUNT    = 3
 TRAP_CHECK_DURATION = 1.5
 TRAP_CHECK_WIDTH    = 0.18
 TRAP_COOLDOWN       = 5.0
+SKILL_BASE_COOLDOWN = 15.0
 SKILL_SPEED_TIME    = 6.0
 SKILL_INVISIBLE_TIME = 5.0
 SKILL_PHASE_TIME    = 2.0
@@ -448,6 +451,15 @@ SKILL_COLORS = {
     "trap": (255, 130, 40),
 }
 RANDOM_SKILLS = ("speed", "invisible", "phase", "spear", "flash", "teleport")
+SKILL_DESCRIPTIONS = {
+    "speed": "Run faster for a short duration.",
+    "invisible": "Hide your body from opponents.",
+    "phase": "Move through walls briefly.",
+    "spear": "Fast global projectile that stuns.",
+    "flash": "Throw a bomb that blinds in an area.",
+    "teleport": "Throw a pearl and teleport to it.",
+    "trap": "Hunter-only trap with skill checks.",
+}
 SKILL_ICON_CELLS = {
     "speed": (0, 0),
     "invisible": (1, 0),
@@ -678,7 +690,25 @@ class Game:
         self.btn_portals = ToggleButton("PORTALS",     bx, H -  64, state=True)
 
         # menu state
-        self.menu_options = ["SINGLE PLAYER", "MULTIPLAYER", "QUIT"]
+        self.profile = progression.load_profile(PROFILE_PATH)
+        progression.save_profile(PROFILE_PATH, self.profile)
+        self.profile_name_input = self.profile.get("name", "")
+        self.profile_editing = False
+        self.daily_notice = ""
+        self.shop_tabs = ["BUY", "UPGRADE", "LOADOUT"]
+        self.shop_tab = 0
+        self.shop_index = 0
+        self.shop_notice = ""
+        self.shop_rects = []
+        self.shop_tab_rects = []
+        self.menu_options = [
+            "SINGLE PLAYER",
+            "MULTIPLAYER",
+            "PROFILE",
+            "DAILY MISSIONS",
+            "SHOP",
+            "QUIT",
+        ]
         self.menu_index   = 0
         self.menu_rects   = []   # populated each frame in draw_menu
 
@@ -734,9 +764,14 @@ class Game:
         self.mp_generators   = []     # list of Generator
         self.mp_freezing_pods   = []     # list of FreezingPod
         self.mp_projectiles  = []
+        self.mp_explosions   = []
         self.mp_skill_orbs   = []
         self.mp_traps        = []
         self.mp_orb_timer    = 0.0
+        self.mp_network_profiles = {
+            0: progression.network_profile(self.profile)
+        }
+        self.mp_match_rewarded = False
         self.mp_match_timer  = 0.0    # countdown seconds remaining in DBD match
         self.exit_unlocked   = True   # escape: always True; DBD: False until all gens done
 
@@ -797,9 +832,13 @@ class Game:
             self.maze_floor_surface = None
             return
 
-        actor_size = max(34, int(CELL * 1.7))
+        actor_sizes = {
+            "hunter": max(42, int(CELL * 2.05)),
+            "runner": max(30, int(CELL * 1.42)),
+        }
         for role, col in (("hunter", 0), ("runner", 1)):
             source = self._atlas_cell(characters, col, 0, 2, 1)
+            actor_size = actor_sizes[role]
             self.actor_sprites[role] = pygame.transform.smoothscale(
                 source, (actor_size, actor_size)
             )
@@ -1079,6 +1118,133 @@ class Game:
             self.surf.blit(ls, (ox + ow // 2 - ls.get_width() // 2, oy + 120 + i * 40))
 
     # ── menu ──────────────────────────────────────────────────────────────────
+    def _save_profile(self):
+        progression.save_profile(PROFILE_PATH, self.profile)
+        self.mp_network_profiles[0] = progression.network_profile(self.profile)
+
+    def _record_daily(self, mission_key, amount=1):
+        completed = progression.add_mission_progress(
+            self.profile, mission_key, amount
+        )
+        if completed:
+            definition = progression.MISSION_DEFS[mission_key]
+            self.daily_notice = (
+                f"MISSION COMPLETE  +{definition['coins']} COINS"
+                f"  +{definition['xp']} XP"
+            )
+        self._save_profile()
+
+    def _record_match_result(self):
+        if self.mp_match_rewarded:
+            return
+        self.mp_match_rewarded = True
+        self.profile["stats"]["matches"] += 1
+        self._record_daily("matches")
+
+        me = next(
+            (p for p in self.mp_players if p["id"] == self.player_id),
+            None,
+        )
+        if me is not None and me.get("role") == "runner" \
+                and me.get("escaped"):
+            self.profile["stats"]["escapes"] += 1
+            self.profile["coins"] += 90
+            progression.add_xp(self.profile, 70)
+            self._record_daily("escapes")
+        elif me is not None and me.get("role") == "hunter" \
+                and self.mp_winner == "hunter":
+            self.profile["stats"]["hunter_wins"] += 1
+            self.profile["coins"] += 110
+            progression.add_xp(self.profile, 80)
+        self._save_profile()
+
+    def _shop_skills(self):
+        if self.shop_tabs[self.shop_tab] == "LOADOUT":
+            return [
+                skill for skill in progression.LOADOUT_SKILLS
+                if skill in self.profile["owned_skills"]
+            ]
+        return list(progression.SKILL_ORDER)
+
+    def _shop_selected_skill(self):
+        skills = self._shop_skills()
+        if not skills:
+            return None
+        self.shop_index %= len(skills)
+        return skills[self.shop_index]
+
+    def _shop_action(self):
+        skill = self._shop_selected_skill()
+        if skill is None:
+            return
+        tab = self.shop_tabs[self.shop_tab]
+        owned = skill in self.profile["owned_skills"]
+        level = self.profile["skill_levels"].get(skill, 1)
+
+        if tab == "BUY":
+            if skill == "trap":
+                self.shop_notice = "TRAP IS HUNTER-ONLY AND ALWAYS OWNED"
+            elif owned:
+                self.shop_notice = "ALREADY OWNED"
+            else:
+                price = progression.SKILL_PRICES[skill]
+                if self.profile["coins"] < price:
+                    self.shop_notice = "NOT ENOUGH COINS"
+                    return
+                self.profile["coins"] -= price
+                self.profile["owned_skills"].append(skill)
+                self.shop_notice = f"PURCHASED {SKILL_NAMES[skill]}"
+        elif tab == "UPGRADE":
+            if not owned:
+                self.shop_notice = "BUY THIS SKILL FIRST"
+                return
+            price = progression.skill_upgrade_price(skill, level)
+            if price is None:
+                self.shop_notice = "MAX LEVEL"
+                return
+            if self.profile["coins"] < price:
+                self.shop_notice = "NOT ENOUGH COINS"
+                return
+            self.profile["coins"] -= price
+            self.profile["skill_levels"][skill] = level + 1
+            self.shop_notice = f"{SKILL_NAMES[skill]} LEVEL {level + 1}"
+        else:
+            equipped = self.profile["equipped_skills"]
+            if skill in equipped:
+                equipped.remove(skill)
+                self.shop_notice = f"UNEQUIPPED {SKILL_NAMES[skill]}"
+            elif len(equipped) >= 2:
+                self.shop_notice = "LOADOUT IS FULL"
+                return
+            else:
+                equipped.append(skill)
+                self.shop_notice = f"EQUIPPED {SKILL_NAMES[skill]}"
+        self._save_profile()
+
+    @staticmethod
+    def _skill_level_value(level, base, per_level):
+        return base + max(0, level - 1) * per_level
+
+    def _skill_stats(self, skill, level):
+        cooldown = max(
+            10.0,
+            self._skill_level_value(level, SKILL_BASE_COOLDOWN, -1.0),
+        )
+        charges = 1 + max(0, level - 1) // 2
+        stats = [f"Cooldown {cooldown:.0f}s", f"Charges {charges}"]
+        if skill in ("speed", "invisible", "phase"):
+            base = {
+                "speed": SKILL_SPEED_TIME,
+                "invisible": SKILL_INVISIBLE_TIME,
+                "phase": SKILL_PHASE_TIME,
+            }[skill]
+            stats.append(f"Duration {base * (1 + .12 * (level - 1)):.1f}s")
+        elif skill in ("spear", "flash", "teleport"):
+            stats.append(f"Projectile speed +{12 * (level - 1)}%")
+        if skill == "flash":
+            stats.append(f"AOE {2 + .5 * (level - 1):.1f} cells")
+        return stats
+
     def select_menu_option(self):
         choice = self.menu_options[self.menu_index]
         if choice == "SINGLE PLAYER":
@@ -1087,6 +1253,16 @@ class Game:
         elif choice == "MULTIPLAYER":
             self.mp_status_msg = ""
             self.state = "lobby"
+        elif choice == "PROFILE":
+            self.profile_name_input = self.profile.get("name", "")
+            self.profile_editing = True
+            self.state = "profile"
+        elif choice == "DAILY MISSIONS":
+            self.state = "daily"
+        elif choice == "SHOP":
+            self.shop_notice = ""
+            self.shop_index = 0
+            self.state = "shop"
         elif choice == "QUIT":
             pygame.quit()
             sys.exit()
@@ -1134,7 +1310,9 @@ class Game:
         return False
 
     def draw_lobby_mode_pick(self):
-        self.surf.fill(BLACK)
+        self._draw_frontend_background(
+            "MODE SELECT", "Choose the ruleset for this session."
+        )
 
         title = self.font_xl.render("CHOOSE MODE", True, CYAN)
         self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 5))
@@ -1187,7 +1365,9 @@ class Game:
         return False
 
     def draw_lobby(self):
-        self.surf.fill(BLACK)
+        self._draw_frontend_background(
+            "MULTIPLAYER", "Host a session or connect to another operative."
+        )
 
         title = self.font_xl.render("MULTIPLAYER", True, CYAN)
         self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 5))
@@ -1226,7 +1406,9 @@ class Game:
 
     # ── lobby_join_input ──────────────────────────────────────────────────────
     def draw_lobby_join_input(self):
-        self.surf.fill(BLACK)
+        self._draw_frontend_background(
+            "CONNECT", "Enter the host address to join the facility."
+        )
 
         title = self.font_xl.render("JOIN GAME", True, CYAN)
         self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 5))
@@ -1283,7 +1465,9 @@ class Game:
 
     # ── lobby_wait (host or client waiting room) ──────────────────────────────
     def draw_lobby_wait(self):
-        self.surf.fill(BLACK)
+        self._draw_frontend_background(
+            "READY ROOM", "Configure the match while players connect."
+        )
 
         if self.server is not None:
             title = self.font_xl.render("HOSTING", True, CYAN)
@@ -1364,7 +1548,9 @@ class Game:
 
 
     def draw_lobby_map_vote(self):
-        self.surf.fill(BLACK)
+        self._draw_frontend_background(
+            "MAP VOTE", "Select the facility layout."
+        )
         title = self.font_xl.render("VOTE MAP", True, CYAN)
         self.surf.blit(title, (W // 2 - title.get_width() // 2, 60))
 
@@ -1405,42 +1591,308 @@ class Game:
         self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
 
 
+    def _draw_frontend_background(self, section, subtitle=""):
+        self.surf.fill((3, 7, 12))
+        tile = max(34, CELL * 2)
+        for y in range(0, H, tile):
+            for x in range(0, W, tile):
+                shade = 10 + ((x // tile + y // tile) % 2) * 3
+                pygame.draw.rect(
+                    self.surf, (shade, shade + 7, shade + 12),
+                    (x, y, tile - 1, tile - 1),
+                )
+        veil = pygame.Surface((W, H), pygame.SRCALPHA)
+        veil.fill((1, 4, 8, 178))
+        self.surf.blit(veil, (0, 0))
+        pygame.draw.rect(self.surf, (9, 17, 26), (0, 0, W, 86))
+        pygame.draw.line(self.surf, (26, 139, 160), (0, 85), (W, 85), 2)
+
+        brand = self.font_lg.render("VOID MAZE", True, (86, 234, 220))
+        self.surf.blit(brand, (42, 19))
+        section_text = self.font_sm.render(section, True, (190, 207, 215))
+        self.surf.blit(
+            section_text,
+            (W - section_text.get_width() - 42, 29),
+        )
+        if subtitle:
+            sub = self.font_tiny.render(subtitle, True, (109, 137, 151))
+            self.surf.blit(sub, (44, 94))
+
+        profile_name = self.profile.get("name") or "UNNAMED OPERATIVE"
+        profile = self.font_tiny.render(
+            f"{profile_name}   LV {self.profile['level']}"
+            f"   {self.profile['coins']} C",
+            True, (220, 225, 226),
+        )
+        self.surf.blit(
+            profile, (W - profile.get_width() - 42, H - 34)
+        )
+
+    def _draw_menu_option(self, label, rect, selected):
+        fill = (14, 26, 37) if selected else (9, 16, 24)
+        border = (67, 226, 209) if selected else (31, 57, 69)
+        pygame.draw.rect(self.surf, (1, 3, 6), rect.move(0, 5), border_radius=5)
+        pygame.draw.rect(self.surf, fill, rect, border_radius=5)
+        pygame.draw.rect(self.surf, border, rect, 2, border_radius=5)
+        if selected:
+            pygame.draw.rect(
+                self.surf, (67, 226, 209),
+                (rect.x, rect.y, 5, rect.height), border_radius=2,
+            )
+        text = self.font_med.render(
+            label, True, (236, 241, 242) if selected else (153, 172, 181)
+        )
+        self.surf.blit(
+            text, (rect.x + 24, rect.centery - text.get_height() // 2)
+        )
+
     def draw_menu(self):
-        self.surf.fill(BLACK)
+        self._draw_frontend_background(
+            "MAIN TERMINAL",
+            "SURVIVAL OPERATIONS TERMINAL",
+        )
+        title = self.font_xl.render("ENTER THE VOID", True, WHITE)
+        self.surf.blit(title, (70, 158))
+        accent = self.font_sm.render(
+            "ASYMMETRIC HORROR // MAZE SURVIVAL",
+            True, (235, 75, 78),
+        )
+        self.surf.blit(accent, (74, 230))
 
-        # title
-        title = self.font_xl.render("VOID MAZE", True, CYAN)
-        self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 4))
-
-        subtitle = self.font_sm.render("SELECT MODE", True, (160, 160, 160))
-        self.surf.blit(subtitle, (W // 2 - subtitle.get_width() // 2, H // 4 + 80))
-
-        # options
         self.menu_rects = []
-        opt_h = 60
-        start_y = H // 2
-
+        column_x = 70
+        start_y = 300
+        width = min(470, W // 3)
+        height = 52
         for i, label in enumerate(self.menu_options):
-            selected = (i == self.menu_index)
-            color    = CYAN if selected else WHITE
-            text     = self.font_lg.render(label, True, color)
-            tw, th   = text.get_size()
-            x = W // 2 - tw // 2
-            y = start_y + i * opt_h
-
-            rect = pygame.Rect(x - 20, y - 6, tw + 40, th + 12)
+            rect = pygame.Rect(column_x, start_y + i * 62, width, height)
             self.menu_rects.append(rect)
+            self._draw_menu_option(label, rect, i == self.menu_index)
 
-            if selected:
-                pygame.draw.rect(self.surf, (0, 60, 90), rect, border_radius=6)
-                pygame.draw.rect(self.surf, CYAN, rect, 2, border_radius=6)
+        panel = pygame.Rect(W - 520, 155, 440, 500)
+        pygame.draw.rect(self.surf, (8, 15, 23), panel, border_radius=6)
+        pygame.draw.rect(
+            self.surf, (29, 70, 83), panel, 2, border_radius=6
+        )
+        hunter = self.actor_sprites.get("hunter")
+        runner = self.actor_sprites.get("runner")
+        if hunter is not None:
+            shown = pygame.transform.smoothscale(hunter, (190, 190))
+            self.surf.blit(shown, shown.get_rect(center=(panel.x + 135, panel.y + 175)))
+        if runner is not None:
+            shown = pygame.transform.smoothscale(runner, (135, 135))
+            self.surf.blit(shown, shown.get_rect(center=(panel.x + 315, panel.y + 205)))
+        mission_states = self.profile["daily"]["missions"]
+        complete = sum(1 for state in mission_states.values() if state["claimed"])
+        daily = self.font_med.render(
+            f"DAILY OPERATIONS  {complete}/{len(mission_states)}",
+            True, (240, 205, 71),
+        )
+        self.surf.blit(daily, (panel.x + 28, panel.y + 330))
+        loadout = ", ".join(
+            SKILL_NAMES[skill]
+            for skill in self.profile["equipped_skills"]
+        ) or "EMPTY"
+        loadout_text = self.font_sm.render(
+            f"LOADOUT  {loadout}", True, (174, 196, 206)
+        )
+        self.surf.blit(loadout_text, (panel.x + 28, panel.y + 382))
 
-            self.surf.blit(text, (x, y))
+    def draw_profile(self):
+        self._draw_frontend_background(
+            "PROFILE",
+            "Identity and persistent progression.",
+        )
+        panel = pygame.Rect(W // 2 - 430, 145, 860, 560)
+        pygame.draw.rect(self.surf, (8, 15, 23), panel, border_radius=6)
+        pygame.draw.rect(self.surf, (31, 73, 86), panel, 2, border_radius=6)
 
-        # footer hint
-        hint = self.font_sm.render("UP/DOWN to navigate, ENTER to select, ESC to quit",
-                                   True, (120, 120, 120))
-        self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
+        name_label = self.font_sm.render("PLAYER NAME", True, (120, 149, 163))
+        self.surf.blit(name_label, (panel.x + 44, panel.y + 42))
+        name_box = pygame.Rect(panel.x + 44, panel.y + 82, 500, 62)
+        pygame.draw.rect(self.surf, (4, 9, 15), name_box, border_radius=5)
+        pygame.draw.rect(
+            self.surf, (70, 226, 211), name_box, 2, border_radius=5
+        )
+        value = self.profile_name_input + ("_" if self.profile_editing else "")
+        name_text = self.font_med.render(value or "ENTER NAME", True, WHITE)
+        self.surf.blit(
+            name_text,
+            (name_box.x + 16, name_box.centery - name_text.get_height() // 2),
+        )
+
+        level = self.profile["level"]
+        needed = progression.xp_needed(level)
+        xp = self.profile["xp"]
+        level_text = self.font_lg.render(f"LEVEL {level}", True, (239, 205, 71))
+        self.surf.blit(level_text, (panel.x + 600, panel.y + 55))
+        bar = pygame.Rect(panel.x + 600, panel.y + 115, 210, 14)
+        pygame.draw.rect(self.surf, (27, 42, 51), bar, border_radius=4)
+        pygame.draw.rect(
+            self.surf, (70, 226, 211),
+            (bar.x, bar.y, int(bar.width * xp / max(1, needed)), bar.height),
+            border_radius=4,
+        )
+
+        stats = self.profile["stats"]
+        rows = [
+            ("COINS", str(self.profile["coins"])),
+            ("MATCHES", str(stats["matches"])),
+            ("ESCAPES", str(stats["escapes"])),
+            ("HUNTER WINS", str(stats["hunter_wins"])),
+            ("SKILLS USED", str(stats["skills_used"])),
+        ]
+        for index, (label, number) in enumerate(rows):
+            row = pygame.Rect(
+                panel.x + 44 + (index % 2) * 390,
+                panel.y + 210 + (index // 2) * 82,
+                350, 62,
+            )
+            pygame.draw.rect(self.surf, (11, 21, 30), row, border_radius=5)
+            label_text = self.font_tiny.render(label, True, (111, 141, 154))
+            number_text = self.font_med.render(number, True, WHITE)
+            self.surf.blit(label_text, (row.x + 16, row.y + 9))
+            self.surf.blit(number_text, (row.x + 16, row.y + 27))
+
+        hint = self.font_sm.render("SAVE NAME", True, (130, 157, 169))
+        self.surf.blit(hint, (panel.x + 44, panel.bottom - 52))
+
+    def draw_daily(self):
+        self._draw_frontend_background(
+            "DAILY MISSIONS",
+            "DAILY OPERATIONS",
+        )
+        start_y = 180
+        for index, (key, definition) in enumerate(
+                progression.MISSION_DEFS.items()):
+            state = self.profile["daily"]["missions"][key]
+            card = pygame.Rect(W // 2 - 430, start_y + index * 140, 860, 112)
+            pygame.draw.rect(self.surf, (8, 16, 24), card, border_radius=6)
+            color = (80, 224, 127) if state["claimed"] else (61, 210, 198)
+            pygame.draw.rect(self.surf, color, card, 2, border_radius=6)
+            label = self.font_med.render(definition["label"], True, WHITE)
+            self.surf.blit(label, (card.x + 28, card.y + 18))
+            reward = self.font_sm.render(
+                f"+{definition['coins']} COINS   +{definition['xp']} XP",
+                True, (239, 205, 71),
+            )
+            self.surf.blit(reward, (card.x + 28, card.y + 61))
+            progress = min(state["progress"], definition["target"])
+            status = "CLAIMED" if state["claimed"] else \
+                f"{progress}/{definition['target']}"
+            status_text = self.font_med.render(status, True, color)
+            self.surf.blit(
+                status_text,
+                (card.right - status_text.get_width() - 28, card.y + 37),
+            )
+        if self.daily_notice:
+            notice = self.font_sm.render(
+                self.daily_notice, True, (239, 205, 71)
+            )
+            self.surf.blit(
+                notice, (W // 2 - notice.get_width() // 2, H - 92)
+            )
+
+    def draw_shop(self):
+        self._draw_frontend_background(
+            "SKILL SHOP",
+            "PERMANENT LOADOUT CONFIGURATION",
+        )
+        tab_y = 132
+        self.shop_tab_rects = []
+        for index, label in enumerate(self.shop_tabs):
+            rect = pygame.Rect(W // 2 - 330 + index * 225, tab_y, 210, 48)
+            self.shop_tab_rects.append(rect)
+            selected = index == self.shop_tab
+            pygame.draw.rect(
+                self.surf, (15, 30, 40) if selected else (8, 15, 23),
+                rect, border_radius=5,
+            )
+            pygame.draw.rect(
+                self.surf,
+                (70, 226, 211) if selected else (31, 61, 73),
+                rect, 2, border_radius=5,
+            )
+            text = self.font_sm.render(label, True, WHITE)
+            self.surf.blit(text, text.get_rect(center=rect.center))
+
+        skills = self._shop_skills()
+        self.shop_rects = []
+        grid_x = 70
+        grid_y = 230
+        for index, skill in enumerate(skills):
+            row = index % 4
+            col = index // 4
+            rect = pygame.Rect(grid_x + col * 300, grid_y + row * 98, 270, 78)
+            self.shop_rects.append(rect)
+            selected = index == self.shop_index
+            owned = skill in self.profile["owned_skills"]
+            color = SKILL_COLORS[skill]
+            pygame.draw.rect(self.surf, (9, 17, 25), rect, border_radius=5)
+            pygame.draw.rect(
+                self.surf, color if selected else (31, 57, 68),
+                rect, 3 if selected else 1, border_radius=5,
+            )
+            icon = self.skill_icons.get(skill)
+            if icon is not None:
+                self.surf.blit(icon, icon.get_rect(center=(rect.x + 45, rect.centery)))
+            label = self.font_sm.render(SKILL_NAMES[skill], True, WHITE)
+            self.surf.blit(label, (rect.x + 82, rect.y + 13))
+            state = "OWNED" if owned else f"{progression.SKILL_PRICES[skill]} C"
+            state_text = self.font_tiny.render(
+                state, True, color if owned else (239, 205, 71)
+            )
+            self.surf.blit(state_text, (rect.x + 82, rect.y + 46))
+
+        skill = self._shop_selected_skill()
+        if skill is not None:
+            detail = pygame.Rect(W - 555, 230, 480, 390)
+            pygame.draw.rect(self.surf, (8, 16, 24), detail, border_radius=6)
+            pygame.draw.rect(
+                self.surf, SKILL_COLORS[skill], detail, 2, border_radius=6
+            )
+            icon = self.skill_icons.get(skill)
+            if icon is not None:
+                shown = pygame.transform.smoothscale(icon, (96, 96))
+                self.surf.blit(shown, (detail.x + 28, detail.y + 30))
+            title = self.font_lg.render(SKILL_NAMES[skill], True, WHITE)
+            self.surf.blit(title, (detail.x + 145, detail.y + 34))
+            level = self.profile["skill_levels"].get(skill, 1)
+            level_text = self.font_sm.render(
+                f"LEVEL {level}/{progression.MAX_SKILL_LEVEL}",
+                True, SKILL_COLORS[skill],
+            )
+            self.surf.blit(level_text, (detail.x + 148, detail.y + 92))
+            description = self.font_sm.render(
+                SKILL_DESCRIPTIONS[skill], True, (164, 184, 194)
+            )
+            self.surf.blit(description, (detail.x + 28, detail.y + 150))
+            for index, stat in enumerate(self._skill_stats(skill, level)):
+                text = self.font_sm.render(stat, True, (219, 226, 228))
+                self.surf.blit(text, (detail.x + 32, detail.y + 205 + index * 36))
+
+            tab = self.shop_tabs[self.shop_tab]
+            if tab == "BUY":
+                action = "PURCHASE"
+            elif tab == "UPGRADE":
+                price = progression.skill_upgrade_price(skill, level)
+                action = "MAX LEVEL" if price is None else f"UPGRADE {price} C"
+            else:
+                equipped = skill in self.profile["equipped_skills"]
+                action = "UNEQUIP" if equipped else "EQUIP"
+            action_text = self.font_med.render(
+                action, True, (239, 205, 71)
+            )
+            self.surf.blit(
+                action_text,
+                (detail.x + 28, detail.bottom - action_text.get_height() - 28),
+            )
+
+        if self.shop_notice:
+            notice = self.font_sm.render(
+                self.shop_notice, True, (239, 205, 71)
+            )
+            self.surf.blit(notice, (70, H - 88))
 
     # ── multiplayer: host/client lifecycle ────────────────────────────────────
     def start_host_mode(self):
@@ -1451,6 +1903,9 @@ class Game:
             self.mp_status_msg = f"Server failed to start: {e}"
             return
         self.player_id = 0
+        self.mp_network_profiles = {
+            0: progression.network_profile(self.profile)
+        }
         self.mp_status_msg = ""
         self.state = "lobby_wait_host"
 
@@ -1463,9 +1918,29 @@ class Game:
             self.client = None
             return
         # send hello, wait briefly for welcome (handled in tick)
-        self.client.send({"type": "hello"})
+        self.client.send({
+            "type": "hello",
+            "profile": progression.network_profile(self.profile),
+        })
         self.mp_status_msg = ""
         self.state = "lobby_wait_client"
+
+    def _prune_lobby_connections(self):
+        dead = self.server.prune_dead()
+        if not dead:
+            return
+        remapped = {
+            0: progression.network_profile(self.profile)
+        }
+        for player_id, profile in self.mp_network_profiles.items():
+            if player_id == 0:
+                continue
+            connection_index = player_id - 1
+            if connection_index in dead:
+                continue
+            shift = sum(1 for index in dead if index < connection_index)
+            remapped[player_id - shift] = profile
+        self.mp_network_profiles = remapped
 
     def mp_disconnect(self):
         """Tear down any open server/client; return to main menu."""
@@ -1496,10 +1971,15 @@ class Game:
         self.mp_generators   = []
         self.mp_freezing_pods   = []
         self.mp_projectiles = []
+        self.mp_explosions = []
         self.mp_skill_orbs = []
         self.mp_traps = []
         self.mp_orb_timer = 0.0
         self.mp_winner       = ""
+        self.mp_match_rewarded = False
+        self.mp_network_profiles = {
+            0: progression.network_profile(self.profile)
+        }
         self.exit_unlocked   = True
         self.player_id        = 0
         self.state            = "menu"
@@ -1507,8 +1987,43 @@ class Game:
     # ── host: start a multiplayer match ───────────────────────────────────────
 
     def _initialize_dbd_player(self, p):
-        random_skill = random.choice(RANDOM_SKILLS)
+        profile = self.mp_network_profiles.get(p["id"], {})
+        if p.get("is_bot"):
+            equipped = random.sample(
+                list(RANDOM_SKILLS), min(2, len(RANDOM_SKILLS))
+            )
+            skill_levels = {skill: 1 for skill in progression.SKILL_ORDER}
+            player_name = ""
+        else:
+            equipped = [
+                skill for skill in profile.get("equipped_skills", [])
+                if skill in progression.LOADOUT_SKILLS
+            ][:2]
+            if not equipped:
+                equipped = ["speed"]
+            skill_levels = {
+                skill: max(
+                    1, min(
+                        progression.MAX_SKILL_LEVEL,
+                        int(profile.get("skill_levels", {}).get(skill, 1)),
+                    )
+                )
+                for skill in progression.SKILL_ORDER
+            }
+            player_name = progression.sanitize_name(profile.get("name", ""))
+
+        skills = (
+            ["trap"] + equipped[:1]
+            if p.get("role") == "hunter"
+            else equipped[:2]
+        )
+        charges = {
+            skill: 1 + max(0, skill_levels.get(skill, 1) - 1) // 2
+            for skill in skills
+        }
         p.update({
+            "name": player_name,
+            "escaped": False,
             "downed": False,
             "downed_remaining": 0.0,
             "stun_remaining": 0.0,
@@ -1529,12 +2044,32 @@ class Game:
             "aim_r": float(p["r"]),
             "aim_c": float(p["c"] + 1),
             "selected_skill": 0,
-            "skills": (
-                ["trap", random_skill]
-                if p.get("role") == "hunter"
-                else [random_skill]
-            ),
+            "skills": skills,
+            "skill_levels": skill_levels,
+            "skill_charges": charges,
+            "skill_cooldowns": {skill: 0.0 for skill in skills},
         })
+
+    def _assign_default_player_names(self):
+        runner_number = 0
+        for p in self.mp_players:
+            if p.get("name"):
+                continue
+            if p.get("role") == "hunter":
+                p["name"] = "Hunter"
+            else:
+                runner_number += 1
+                p["name"] = f"Runner {runner_number}"
+
+    def _mark_runner_escaped(self, runner):
+        runner["escaped"] = True
+        runner["alive"] = False
+        runner["downed"] = False
+        runner["carried"] = False
+        runner["imprisoned"] = False
+        for pod in self.mp_freezing_pods:
+            if pod.imprisoned_pid == runner["id"]:
+                pod.imprisoned_pid = None
 
     def _reset_local_action_sequences(self):
         self.mp_skill_seq = 0
@@ -1557,11 +2092,13 @@ class Game:
         self.mp_use_seen = {}
         self._reset_local_action_sequences()
         self.mp_projectiles = []
+        self.mp_explosions = []
         self.mp_skill_orbs = []
         self.mp_traps = []
         self.mp_orb_timer = random.uniform(
             SKILL_ORB_SPAWN_MIN, SKILL_ORB_SPAWN_MAX
         )
+        self.mp_match_rewarded = False
 
     def _spawn_skill_orb(self):
         taken = {
@@ -1581,7 +2118,7 @@ class Game:
             self._spawn_skill_orb()
 
     def host_start_dbd_match(self):
-        self.server.prune_dead()
+        self._prune_lobby_connections()
         self.new_level()
         self.mp_generators = []
         self.mp_freezing_pods = []
@@ -1592,6 +2129,7 @@ class Game:
         
         slots = 1 + self.server.count() + self.mp_settings.get("bot_runners", 0)
         self.mp_players = []
+        self.mp_move_timers = []
         
         # Load map
         if self.mp_selected_map == 0:
@@ -1669,11 +2207,12 @@ class Game:
             self._initialize_dbd_player(self.mp_players[-1])
             self.mp_move_timers.append(0.0)
 
+        self._assign_default_player_names()
         for cell in gen_pos:
             self.mp_generators.append(Generator(cell[0], cell[1]))
         for cell in pod_pos:
             self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
-        self._seed_skill_orbs()
+        self.mp_skill_orbs = []
             
         self.state = "mp_play"
         self.server.broadcast({"type": "start", **self._serialize_state()})
@@ -1682,7 +2221,7 @@ class Game:
     def host_start_match(self):
         """Host pressed SPACE — initialise level and broadcast maze + start."""
         # clean any dead connections BEFORE locking in player_id assignments
-        self.server.prune_dead()
+        self._prune_lobby_connections()
 
         self.new_level()
         self.mp_generators = []
@@ -1727,6 +2266,9 @@ class Game:
                 self.mp_players.append({
                     "id": i, "r": r, "c": c, "alive": True,
                     "role": role,
+                    "name": progression.sanitize_name(
+                        self.mp_network_profiles.get(i, {}).get("name", "")
+                    ),
                     "imprisoned": False, "imprison_remaining": 0.0,
                     "carried": False, "carrying_pid": None,
                     "stun_remaining": 0.0,
@@ -1768,10 +2310,11 @@ class Game:
                 if cell is None: break
                 taken.append(cell)
                 self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
-            self._seed_skill_orbs()
+            self.mp_skill_orbs = []
             # DBD-MAZE: no portals
             self.portals = []
 
+        self._assign_default_player_names()
         self.mp_move_timers = [0.0] * network.MAX_PLAYERS
 
         # broadcast maze then start (include mode + DBD entities)
@@ -1829,6 +2372,7 @@ class Game:
             ],
             "fp":      [w.imprisoned_pid for w in self.mp_freezing_pods],
             "projectiles": self.mp_projectiles,
+            "explosions": self.mp_explosions,
             "skill_orbs": self.mp_skill_orbs,
             "traps": self.mp_traps,
             "timer":   self.mp_match_timer,
@@ -1867,6 +2411,7 @@ class Game:
             if i < len(wh):
                 w.imprisoned_pid = wh[i]
         self.mp_projectiles = msg.get("projectiles", [])
+        self.mp_explosions = msg.get("explosions", [])
         self.mp_skill_orbs = msg.get("skill_orbs", [])
         self.mp_traps = msg.get("traps", [])
         self.mp_match_timer = msg.get("timer", self.mp_match_timer)
@@ -1900,6 +2445,7 @@ class Game:
                 "attack_anim", "trap_cooldown",
             ):
                 p[key] = max(0.0, p.get(key, 0.0) - dt)
+            self._update_skill_cooldowns(p, dt)
 
             if p.get("downed") and not p.get("carried") \
                     and not p.get("imprisoned"):
@@ -1984,11 +2530,8 @@ class Game:
                                 return
                         elif self.mp_mode == "dbd" and p["role"] == "runner" \
                              and self.exit_unlocked:
-                            # Runner reached the exit after all gens were repaired.
-                            self.mp_winner = "runners"
-                            self.state = "mp_end"
-                            self.server.broadcast({"type": "end", "winner": "runners"})
-                            return
+                            # Escapes are individual; remaining runners keep playing.
+                            self._mark_runner_escaped(p)
 
         # 4. gates — any adjacent alive player holding E drives toggle
         for gate in self.gates:
@@ -2108,7 +2651,7 @@ class Game:
         )
         preferred = None
         if p.get("role") == "hunter" and "trap" in skills \
-                and distance <= 2.0 and p.get("trap_cooldown", 0.0) <= 0:
+                and distance <= 2.0 and self._skill_has_charge(p, "trap"):
             preferred = "trap"
         elif distance <= 7.0:
             for skill in ("spear", "flash", "speed", "invisible", "phase", "teleport"):
@@ -2842,15 +3385,52 @@ class Game:
         runner["ai_state"] = "idle"
         runner["ai_target_pos"] = None
 
+    @staticmethod
+    def _skill_level(p, skill):
+        return max(1, int(p.get("skill_levels", {}).get(skill, 1)))
+
+    def _skill_max_charges(self, p, skill):
+        return 1 + max(0, self._skill_level(p, skill) - 1) // 2
+
+    def _skill_cooldown_time(self, p, skill):
+        return max(
+            10.0,
+            SKILL_BASE_COOLDOWN - (self._skill_level(p, skill) - 1),
+        )
+
+    def _skill_has_charge(self, p, skill):
+        return p.get("skill_charges", {}).get(skill, 0) > 0
+
     def _consume_player_skill(self, p, index):
         skills = p.get("skills", [])
         if not (0 <= index < len(skills)):
             return
-        if skills[index] != "trap":
-            skills.pop(index)
-        p["selected_skill"] = min(
-            p.get("selected_skill", 0), max(0, len(skills) - 1)
-        )
+        skill = skills[index]
+        charges = p.setdefault("skill_charges", {})
+        cooldowns = p.setdefault("skill_cooldowns", {})
+        charges[skill] = max(0, charges.get(skill, 0) - 1)
+        if charges[skill] < self._skill_max_charges(p, skill) \
+                and cooldowns.get(skill, 0.0) <= 0:
+            cooldowns[skill] = self._skill_cooldown_time(p, skill)
+
+    def _update_skill_cooldowns(self, p, dt):
+        charges = p.setdefault("skill_charges", {})
+        cooldowns = p.setdefault("skill_cooldowns", {})
+        for skill in p.get("skills", []):
+            maximum = self._skill_max_charges(p, skill)
+            charges[skill] = min(maximum, max(0, charges.get(skill, maximum)))
+            if charges[skill] >= maximum:
+                cooldowns[skill] = 0.0
+                continue
+            cooldowns[skill] = max(
+                0.0, cooldowns.get(skill, self._skill_cooldown_time(p, skill)) - dt
+            )
+            if cooldowns[skill] <= 0:
+                charges[skill] += 1
+                cooldowns[skill] = (
+                    self._skill_cooldown_time(p, skill)
+                    if charges[skill] < maximum else 0.0
+                )
 
     def _launch_projectile(self, p, kind, speed, max_range, target=None):
         target_r = target_c = None
@@ -2874,6 +3454,7 @@ class Game:
         self.mp_projectiles.append({
             "kind": kind,
             "owner_id": p["id"],
+            "skill_level": self._skill_level(p, kind),
             "r": float(p["r"]),
             "c": float(p["c"]),
             "vr": facing_r * speed,
@@ -2897,10 +3478,11 @@ class Game:
             0, min(p.get("selected_skill", 0), len(skills) - 1)
         )
         skill = skills[index]
+        if not self._skill_has_charge(p, skill):
+            return
 
         if skill == "trap":
-            if p.get("role") != "hunter" \
-                    or p.get("trap_cooldown", 0.0) > 0:
+            if p.get("role") != "hunter":
                 return
             cell = (p["r"], p["c"])
             if any((t["r"], t["c"]) == cell for t in self.mp_traps):
@@ -2908,29 +3490,32 @@ class Game:
             self.mp_traps.append({
                 "r": cell[0], "c": cell[1], "owner_id": p["id"]
             })
-            p["trap_cooldown"] = TRAP_COOLDOWN
+            self._consume_player_skill(p, index)
             return
 
+        level = self._skill_level(p, skill)
+        duration_scale = 1.0 + 0.12 * (level - 1)
+        projectile_scale = 1.0 + 0.12 * (level - 1)
         if skill == "speed":
-            p["speed_remaining"] = SKILL_SPEED_TIME
+            p["speed_remaining"] = SKILL_SPEED_TIME * duration_scale
         elif skill == "invisible":
-            p["invisible_remaining"] = SKILL_INVISIBLE_TIME
+            p["invisible_remaining"] = SKILL_INVISIBLE_TIME * duration_scale
         elif skill == "phase":
-            p["phase_remaining"] = SKILL_PHASE_TIME
+            p["phase_remaining"] = SKILL_PHASE_TIME * duration_scale
         elif skill == "spear":
             rows = len(self.walls)
             cols = len(self.walls[0]) if rows else 0
             self._launch_projectile(
-                p, "spear", 16.0, math.hypot(rows, cols)
+                p, "spear", 18.0 * projectile_scale, math.hypot(rows, cols)
             )
         elif skill == "flash":
             self._launch_projectile(
-                p, "flash", 7.0, 0.0,
+                p, "flash", 8.25 * projectile_scale, 0.0,
                 (p.get("aim_r", p["r"]), p.get("aim_c", p["c"])),
             )
         elif skill == "teleport":
             self._launch_projectile(
-                p, "teleport", 5.0, 0.0,
+                p, "teleport", 6.0 * projectile_scale, 0.0,
                 (p.get("aim_r", p["r"]), p.get("aim_c", p["c"])),
             )
         else:
@@ -2951,16 +3536,34 @@ class Game:
         )
         if owner is None:
             return
+        level = max(1, int(projectile.get("skill_level", 1)))
+        half_extent = 1.0 + 0.25 * (level - 1)
+        blind_time = SKILL_BLIND_TIME * (1.0 + 0.12 * (level - 1))
+        self.mp_explosions.append({
+            "r": float(projectile["r"]),
+            "c": float(projectile["c"]),
+            "age": 0.0,
+            "duration": 0.58,
+            "half_extent": half_extent,
+        })
         for target in self.mp_players:
             if not target["alive"] or not self._players_are_opponents(
                     owner, target):
                 continue
-            if abs(target["r"] - projectile["r"]) <= 1.0 \
-                    and abs(target["c"] - projectile["c"]) <= 1.0:
+            if abs(target["r"] - projectile["r"]) <= half_extent \
+                    and abs(target["c"] - projectile["c"]) <= half_extent:
                 target["blind_remaining"] = max(
                     target.get("blind_remaining", 0.0),
-                    SKILL_BLIND_TIME,
+                    blind_time,
                 )
+
+    def _update_explosions(self, dt):
+        active = []
+        for explosion in self.mp_explosions:
+            explosion["age"] += dt
+            if explosion["age"] < explosion["duration"]:
+                active.append(explosion)
+        self.mp_explosions = active
 
     def _finish_teleport_projectile(self, projectile):
         owner = next(
@@ -3040,7 +3643,11 @@ class Game:
                                 )
                                 target["stun_remaining"] = max(
                                     target.get("stun_remaining", 0.0),
-                                    0.7 + 9.3 * frac,
+                                    (0.7 + 9.3 * frac) * (
+                                        1.0 + 0.08 * (
+                                            int(projectile.get("skill_level", 1)) - 1
+                                        )
+                                    ),
                                 )
                                 finished = True
                                 break
@@ -3183,8 +3790,8 @@ class Game:
                 self._activate_selected_skill(p)
 
         self._update_projectiles(dt)
+        self._update_explosions(dt)
         self._update_traps(dt, skill_presses)
-        self._update_skill_orbs(dt)
 
         # Generators: repair speed stacks; one shared skill check can interrupt it.
         for gen in self.mp_generators:
@@ -3310,10 +3917,22 @@ class Game:
                             w.imprisoned_pid = None
 
         # win check: all runners eliminated → hunter wins
+        self._check_dbd_win_conditions()
+
+    def _check_dbd_win_conditions(self):
         runners = [p for p in self.mp_players if p["role"] == "runner"]
-        if runners and all(not p["alive"] for p in runners):
-            self._end_dbd("hunter")
-            return
+        escaped = [p for p in runners if p.get("escaped")]
+        active = [
+            p for p in runners
+            if p["alive"] and not p.get("escaped")
+        ]
+        if active and all(p.get("imprisoned") for p in active):
+            self._end_dbd("runners" if escaped else "hunter")
+            return True
+        if runners and not active:
+            self._end_dbd("runners" if escaped else "hunter")
+            return True
+        return False
 
     def _imprison_runner_in(self, runner, w):
         runner["r"], runner["c"] = w.r, w.c
@@ -3355,6 +3974,7 @@ class Game:
     def _end_dbd(self, winner):
         self.mp_winner = winner
         self.state = "mp_end"
+        self._record_match_result()
         # final state push so clients see correct positions / timer
         if self.server is not None:
             self.server.broadcast(self._serialize_state())
@@ -3419,12 +4039,14 @@ class Game:
             elif t == "start":
                 self.mp_mode   = msg.get("mode", "escape")
                 self.mp_winner = ""
+                self.mp_match_rewarded = False
                 self._reset_local_action_sequences()
                 if self.state in ("lobby_wait_client", "mp_end"):
                     self.state = "mp_play"
             elif t == "end":
                 self.mp_winner = msg.get("winner", "")
                 self.state = "mp_end"
+                self._record_match_result()
 
         if not self.client.alive:
             self.mp_status_msg = "Lost connection to host."
@@ -3494,6 +4116,54 @@ class Game:
             if kind == "teleport" \
                     and projectile["owner_id"] == self.player_id:
                 self._draw_teleport_prediction(projectile)
+
+        for explosion in self.mp_explosions:
+            duration = max(0.01, explosion.get("duration", 0.58))
+            progress = min(1.0, explosion.get("age", 0.0) / duration)
+            x = int(explosion["c"] * CELL + MAZE_OX + CELL // 2)
+            y = int(explosion["r"] * CELL + MAZE_OY + CELL // 2)
+            half_extent = explosion.get("half_extent", 1.0)
+            maximum = max(CELL, int(half_extent * CELL))
+            radius = max(4, int(maximum * (0.25 + 0.9 * progress)))
+            alpha = max(0, int(230 * (1.0 - progress)))
+            size = maximum * 2 + CELL * 2
+            blast = pygame.Surface((size, size), pygame.SRCALPHA)
+            center = size // 2
+
+            pygame.draw.circle(
+                blast, (255, 228, 98, alpha // 3),
+                (center, center), radius,
+            )
+            pygame.draw.circle(
+                blast, (255, 244, 205, alpha),
+                (center, center), radius, max(2, CELL // 8),
+            )
+            square_half = int(maximum * min(1.0, progress * 1.5))
+            pygame.draw.rect(
+                blast, (255, 164, 55, alpha),
+                (
+                    center - square_half, center - square_half,
+                    square_half * 2, square_half * 2,
+                ),
+                max(2, CELL // 10),
+            )
+            for index in range(12):
+                angle = index * math.tau / 12 + progress * 0.8
+                inner = radius * 0.45
+                outer = radius * (1.1 + 0.35 * (index % 2))
+                pygame.draw.line(
+                    blast, (255, 193, 70, alpha),
+                    (
+                        center + math.cos(angle) * inner,
+                        center + math.sin(angle) * inner,
+                    ),
+                    (
+                        center + math.cos(angle) * outer,
+                        center + math.sin(angle) * outer,
+                    ),
+                    max(2, CELL // 12),
+                )
+            self.surf.blit(blast, (x - center, y - center))
 
     def _draw_teleport_prediction(self, projectile):
         r = float(projectile["r"])
@@ -3703,6 +4373,15 @@ class Game:
                  (radius + 7) * 2, (radius + 7) * 2),
                 0, math.tau, 3,
             )
+        name_color = (255, 76, 76) if role == "hunter" else WHITE
+        name_text = self.font_tiny.render(
+            p.get("name", "Hunter" if role == "hunter" else "Runner"),
+            True, name_color,
+        )
+        self.surf.blit(
+            name_text,
+            (x - name_text.get_width() // 2, y - radius - 25),
+        )
 
     def draw_mp_play(self):
         self.draw_maze()
@@ -3821,14 +4500,23 @@ class Game:
                     self.surf.blit(
                         fallback, fallback.get_rect(center=rect.center)
                     )
-                if skill == "trap" and me.get("trap_cooldown", 0.0) > 0:
+                charges = me.get("skill_charges", {}).get(skill, 0)
+                cooldown_value = me.get("skill_cooldowns", {}).get(skill, 0.0)
+                if charges <= 0 and cooldown_value > 0:
                     veil = pygame.Surface((slot_size, slot_size), pygame.SRCALPHA)
                     veil.fill((0, 0, 0, 155))
                     self.surf.blit(veil, rect)
                     cooldown = self.font_sm.render(
-                        f"{me['trap_cooldown']:.1f}", True, WHITE
+                        f"{cooldown_value:.1f}", True, WHITE
                     )
                     self.surf.blit(cooldown, cooldown.get_rect(center=rect.center))
+                charge_text = self.font_tiny.render(
+                    f"x{charges}", True, WHITE
+                )
+                self.surf.blit(
+                    charge_text,
+                    (rect.right - charge_text.get_width() - 5, rect.bottom - 20),
+                )
             if index == selected and skill:
                 key = self.font_tiny.render("F", True, (8, 12, 18))
                 badge = pygame.Rect(rect.x + 5, rect.y + 5, 19, 19)
@@ -4038,9 +4726,12 @@ class Game:
             else:
                 color    = PLAYER_COLORS[p["id"] % len(PLAYER_COLORS)]
                 role_tag = "RUNNER"
-            label = f"P{p['id'] + 1}" + \
-                    ("  YOU" if p["id"] == self.player_id else "")
-            if not p["alive"]:
+            label = p.get(
+                "name", "Hunter" if p.get("role") == "hunter" else "Runner"
+            ) + ("  YOU" if p["id"] == self.player_id else "")
+            if p.get("escaped"):
+                status = "ESCAPED"
+            elif not p["alive"]:
                 status = "ELIMINATED"
             elif p.get("imprisoned"):
                 status = f"FROZEN  {p['imprison_remaining']:.0f}s"
@@ -4067,7 +4758,11 @@ class Game:
             pygame.draw.circle(
                 self.surf, color, (row.x + 19, row.centery), 6
             )
-            name_text = self.font_tiny.render(label, True, (228, 235, 238))
+            name_color = (
+                (255, 76, 76)
+                if p.get("role") == "hunter" else WHITE
+            )
+            name_text = self.font_tiny.render(label, True, name_color)
             role_text = self.font_tiny.render(role_tag, True, color)
             status_color = (
                 (104, 217, 139) if status == "ALIVE" else (229, 185, 82)
@@ -4087,11 +4782,11 @@ class Game:
         if self.mp_winner == "runners":
             title  = "RUNNERS WIN"
             color  = (80, 255, 80)
-            reason = "A runner reached the exit."
+            reason = "At least one runner escaped the facility."
         elif self.mp_winner == "hunter":
             title  = "HUNTER WINS"
             color  = (255, 80, 80)
-            reason = "Time ran out or all runners eliminated."
+            reason = "All runners were eliminated, frozen, or time expired."
         else:
             title  = "MATCH OVER"
             color  = WHITE
@@ -4168,7 +4863,10 @@ class Game:
         """Host restarts the match with current mode + settings."""
         if self.server is None:
             return
-        self.host_start_match()
+        if self.mp_mode == "dbd":
+            self.host_start_dbd_match()
+        else:
+            self.host_start_match()
 
     # ── main loop ─────────────────────────────────────────────────────────────
     def run(self):
@@ -4205,6 +4903,13 @@ class Game:
                             self.state = "lobby"
                         elif self.state == "lobby":
                             self.state = "menu"
+                        elif self.state in ("profile", "daily", "shop"):
+                            if self.state == "profile":
+                                self.profile_name_input = self.profile.get(
+                                    "name", ""
+                                )
+                                self.profile_editing = False
+                            self.state = "menu"
                         else:
                             self.state = "menu"
 
@@ -4217,6 +4922,8 @@ class Game:
 
                     elif self.state == "mp_play" and event.key == pygame.K_f:
                         self.mp_use_seq += 1
+                        self.profile["stats"]["skills_used"] += 1
+                        self._record_daily("skills")
 
                     elif self.state == "menu":
                         if event.key in (pygame.K_UP, pygame.K_w):
@@ -4225,6 +4932,52 @@ class Game:
                             self.menu_index = (self.menu_index + 1) % len(self.menu_options)
                         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
                             self.select_menu_option()
+
+                    elif self.state == "profile":
+                        if event.key == pygame.K_RETURN:
+                            self.profile["name"] = progression.sanitize_name(
+                                self.profile_name_input
+                            )
+                            self.profile_name_input = self.profile["name"]
+                            self.profile_editing = False
+                            self._save_profile()
+                        elif event.key == pygame.K_BACKSPACE:
+                            self.profile_name_input = \
+                                self.profile_name_input[:-1]
+                        elif event.unicode and not (
+                                pygame.key.get_mods() & pygame.KMOD_CTRL):
+                            self.profile_name_input = \
+                                progression.sanitize_name(
+                                    self.profile_name_input + event.unicode
+                                )
+
+                    elif self.state == "shop":
+                        if event.key in (pygame.K_LEFT, pygame.K_a):
+                            self.shop_tab = (
+                                self.shop_tab - 1
+                            ) % len(self.shop_tabs)
+                            self.shop_index = 0
+                            self.shop_notice = ""
+                        elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                            self.shop_tab = (
+                                self.shop_tab + 1
+                            ) % len(self.shop_tabs)
+                            self.shop_index = 0
+                            self.shop_notice = ""
+                        elif event.key in (pygame.K_UP, pygame.K_w):
+                            skills = self._shop_skills()
+                            if skills:
+                                self.shop_index = (
+                                    self.shop_index - 1
+                                ) % len(skills)
+                        elif event.key in (pygame.K_DOWN, pygame.K_s):
+                            skills = self._shop_skills()
+                            if skills:
+                                self.shop_index = (
+                                    self.shop_index + 1
+                                ) % len(skills)
+                        elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                            self._shop_action()
 
                     elif self.state == "lobby":
                         if event.key in (pygame.K_UP, pygame.K_w):
@@ -4321,6 +5074,22 @@ class Game:
                         self.mp_attack_seq += 1
                     elif self.state == "menu":
                         self.handle_menu_click(event.pos)
+                    elif self.state == "shop":
+                        tab_clicked = False
+                        for index, rect in enumerate(self.shop_tab_rects):
+                            if rect.collidepoint(event.pos):
+                                self.shop_tab = index
+                                self.shop_index = 0
+                                self.shop_notice = ""
+                                tab_clicked = True
+                                break
+                        if tab_clicked:
+                            continue
+                        for index, rect in enumerate(self.shop_rects):
+                            if rect.collidepoint(event.pos):
+                                self.shop_index = index
+                                self._shop_action()
+                                break
                     elif self.state == "lobby":
                         self.handle_lobby_click(event.pos)
                     elif self.state == "lobby_mode_pick":
@@ -4417,8 +5186,11 @@ class Game:
                 # accept hellos, send welcomes
                 for ci, msg in self.server.drain_all():
                     if msg.get("type") == "hello":
+                        self.mp_network_profiles[ci + 1] = msg.get(
+                            "profile", {}
+                        )
                         self.server.send_to(ci, {"type": "welcome", "id": ci + 1})
-                self.server.prune_dead()
+                self._prune_lobby_connections()
 
             elif self.state == "lobby_wait_client" and self.client is not None:
                 self.mp_client_tick(dt)
@@ -4485,6 +5257,15 @@ class Game:
             # ── render ────────────────────────────────────────────────────────
             if self.state == "menu":
                 self.draw_menu()
+
+            elif self.state == "profile":
+                self.draw_profile()
+
+            elif self.state == "daily":
+                self.draw_daily()
+
+            elif self.state == "shop":
+                self.draw_shop()
 
             elif self.state == "lobby":
                 self.draw_lobby()
