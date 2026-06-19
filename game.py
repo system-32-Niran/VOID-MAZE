@@ -1985,7 +1985,7 @@ class Game:
             self.surf, (29, 70, 83), panel, 2, border_radius=6
         )
 
-        sidebar_w = 270
+        sidebar_w = 320
         divider_x = panel.x + sidebar_w
         pygame.draw.line(
             self.surf, (26, 64, 78),
