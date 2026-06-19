@@ -654,15 +654,20 @@ class ToggleButton:
         return False
 
     def draw(self, surf, font):
-        color_on  = (0, 180, 80)
-        color_off = (120, 30, 30)
+        color_on  = (70, 226, 211)
+        color_off = (238, 78, 82)
         color     = color_on if self.state else color_off
 
-        pygame.draw.rect(surf, color,      self.rect, border_radius=6)
-        pygame.draw.rect(surf, WHITE,      self.rect, 1, border_radius=6)
+        pygame.draw.rect(surf, (12, 22, 31), self.rect, border_radius=5)
+        pygame.draw.rect(surf, color, self.rect, 2, border_radius=5)
+        pygame.draw.rect(
+            surf, color,
+            (self.rect.x, self.rect.y, 5, self.rect.height),
+            border_radius=2,
+        )
 
         tag  = "ON" if self.state else "OFF"
-        text = font.render(f"{self.label}  [{tag}]", True, WHITE)
+        text = font.render(f"{self.label}  {tag}", True, WHITE)
         surf.blit(text, (self.rect.x + 10, self.rect.y + (self.H - text.get_height()) // 2))
 
 
@@ -701,6 +706,14 @@ class Game:
         self.shop_notice = ""
         self.shop_rects = []
         self.shop_tab_rects = []
+        self.shop_action_rect = None
+        self.profile_save_rect = None
+        self.profile_name_rect = None
+        self.join_connect_rect = None
+        self.setting_click_rects = []
+        self.lobby_start_rect = None
+        self.map_vote_rects = []
+        self.click_effects = []
         self.menu_options = [
             "SINGLE PLAYER",
             "MULTIPLAYER",
@@ -772,6 +785,7 @@ class Game:
             0: progression.network_profile(self.profile)
         }
         self.mp_match_rewarded = False
+        self.mp_reward_summary = {}
         self.mp_match_timer  = 0.0    # countdown seconds remaining in DBD match
         self.exit_unlocked   = True   # escape: always True; DBD: False until all gens done
 
@@ -1000,11 +1014,18 @@ class Game:
         pygame.draw.rect(self.surf, (0, 200, 255), (MAZE_OX, MAZE_OY, bar_w, 4))
 
     def draw_panel(self):
-        pygame.draw.rect(self.surf, PANEL_BG, (PANEL_X, 0, PANEL_W, H))
-        pygame.draw.line(self.surf, (0, 120, 200), (PANEL_X, 0), (PANEL_X, H), 3)
-
-        title = self.font_lg.render("VOID MAZE", True, CYAN)
-        self.surf.blit(title, (PANEL_X + PANEL_W // 2 - title.get_width() // 2, 24))
+        self.surf.blit(self.panel_surface, (PANEL_X, 0))
+        pygame.draw.line(
+            self.surf, (26, 145, 174), (PANEL_X, 0), (PANEL_X, H), 3
+        )
+        brand = self.font_tiny.render("VOID // MAZE", True, (111, 137, 150))
+        self.surf.blit(brand, (PANEL_X + 22, 20))
+        title = self.font_med.render("SOLO RUN", True, CYAN)
+        self.surf.blit(title, (PANEL_X + 20, 48))
+        pygame.draw.line(
+            self.surf, (27, 62, 77),
+            (PANEL_X + 18, 88), (PANEL_X + PANEL_W - 18, 88), 1,
+        )
 
         stats = [
             f"LEVEL   : {self.level}",
@@ -1012,19 +1033,20 @@ class Game:
             f"PORTALS : {self.portal_count}",
         ]
         for i, text in enumerate(stats):
-            s = self.font_med.render(text, True, WHITE)
-            self.surf.blit(s, (PANEL_X + 24, 110 + i * 48))
+            row = pygame.Rect(PANEL_X + 18, 112 + i * 58, PANEL_W - 36, 46)
+            pygame.draw.rect(self.surf, (11, 20, 29), row, border_radius=5)
+            s = self.font_sm.render(text, True, WHITE)
+            self.surf.blit(
+                s, (row.x + 14, row.centery - s.get_height() // 2)
+            )
 
         # countdown label
         if self.btn_maze.state:
             secs  = max(0, MAZE_CHANGE_INTERVAL - self.maze_timer)
-            label = self.font_sm.render(f"SHIFT IN : {secs:.1f}s", True, (0, 200, 255))
-            self.surf.blit(label, (PANEL_X + 24, 110 + 3 * 48))
-
-        # controls hint
-        hint_y = H - 200
-        hint   = self.font_sm.render("HOLD E : open gate", True, (160, 160, 160))
-        self.surf.blit(hint, (PANEL_X + 24, hint_y))
+            label = self.font_tiny.render(
+                f"SHIFT  {secs:.1f}s", True, (70, 226, 211)
+            )
+            self.surf.blit(label, (PANEL_X + 22, 292))
 
         # toggle buttons
         self.btn_maze.draw(self.surf,    self.font_sm)
@@ -1106,21 +1128,35 @@ class Game:
         oy = MAZE_OY + MAZE_H // 2 - oh // 2
 
         overlay = pygame.Surface((ow, oh), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 220))
+        overlay.fill((7, 14, 22, 242))
         self.surf.blit(overlay, (ox, oy))
-        pygame.draw.rect(self.surf, color, (ox, oy, ow, oh), 3)
+        pygame.draw.rect(
+            self.surf, (31, 73, 86), (ox, oy, ow, oh), 2,
+            border_radius=6,
+        )
+        pygame.draw.rect(
+            self.surf, color, (ox, oy, 6, oh), border_radius=3
+        )
 
-        ts = self.font_xl.render(title, True, color)
-        self.surf.blit(ts, (ox + ow // 2 - ts.get_width() // 2, oy + 30))
+        ts = self.font_xl.render(title, True, WHITE)
+        self.surf.blit(ts, (ox + 38, oy + 30))
 
         for i, line in enumerate(lines):
-            ls = self.font_med.render(line, True, WHITE)
-            self.surf.blit(ls, (ox + ow // 2 - ls.get_width() // 2, oy + 120 + i * 40))
+            ls = self.font_sm.render(line, True, (178, 199, 207))
+            self.surf.blit(ls, (ox + 42, oy + 120 + i * 34))
 
     # ── menu ──────────────────────────────────────────────────────────────────
     def _save_profile(self):
         progression.save_profile(PROFILE_PATH, self.profile)
         self.mp_network_profiles[0] = progression.network_profile(self.profile)
+
+    def _commit_profile_name(self):
+        self.profile["name"] = progression.sanitize_name(
+            self.profile_name_input
+        )
+        self.profile_name_input = self.profile["name"]
+        self.profile_editing = False
+        self._save_profile()
 
     def _record_daily(self, mission_key, amount=1):
         completed = progression.add_mission_progress(
@@ -1145,17 +1181,54 @@ class Game:
             (p for p in self.mp_players if p["id"] == self.player_id),
             None,
         )
+        match_time = float(me.get("match_time", 0.0)) if me else 0.0
+        generators = int(me.get("match_generators", 0)) if me else 0
+        rescues = int(me.get("match_rescues", 0)) if me else 0
+        downs = int(me.get("match_downs", 0)) if me else 0
+        skill_hits = int(me.get("match_skill_hits", 0)) if me else 0
+        time_blocks = int(match_time // 30)
+        coins = (
+            time_blocks * 6
+            + generators * 140
+            + rescues * 180
+            + downs * 160
+            + skill_hits * 60
+        )
+        xp = (
+            time_blocks * 4
+            + generators * 90
+            + rescues * 120
+            + downs * 100
+            + skill_hits * 35
+        )
+        outcome_bonus = 0
+
         if me is not None and me.get("role") == "runner" \
                 and me.get("escaped"):
             self.profile["stats"]["escapes"] += 1
-            self.profile["coins"] += 90
-            progression.add_xp(self.profile, 70)
+            outcome_bonus = 250
+            coins += outcome_bonus
+            xp += 150
             self._record_daily("escapes")
         elif me is not None and me.get("role") == "hunter" \
                 and self.mp_winner == "hunter":
             self.profile["stats"]["hunter_wins"] += 1
-            self.profile["coins"] += 110
-            progression.add_xp(self.profile, 80)
+            outcome_bonus = 300
+            coins += outcome_bonus
+            xp += 180
+
+        self.profile["coins"] += coins
+        progression.add_xp(self.profile, xp)
+        self.mp_reward_summary = {
+            "time": match_time,
+            "generators": generators,
+            "rescues": rescues,
+            "downs": downs,
+            "skill_hits": skill_hits,
+            "outcome_bonus": outcome_bonus,
+            "coins": coins,
+            "xp": xp,
+        }
         self._save_profile()
 
     def _shop_skills(self):
@@ -1164,7 +1237,7 @@ class Game:
                 skill for skill in progression.LOADOUT_SKILLS
                 if skill in self.profile["owned_skills"]
             ]
-        return list(progression.SKILL_ORDER)
+        return list(progression.LOADOUT_SKILLS)
 
     def _shop_selected_skill(self):
         skills = self._shop_skills()
@@ -1182,9 +1255,7 @@ class Game:
         level = self.profile["skill_levels"].get(skill, 1)
 
         if tab == "BUY":
-            if skill == "trap":
-                self.shop_notice = "TRAP IS HUNTER-ONLY AND ALWAYS OWNED"
-            elif owned:
+            if owned:
                 self.shop_notice = "ALREADY OWNED"
             else:
                 price = progression.SKILL_PRICES[skill]
@@ -1213,9 +1284,9 @@ class Game:
             if skill in equipped:
                 equipped.remove(skill)
                 self.shop_notice = f"UNEQUIPPED {SKILL_NAMES[skill]}"
-            elif len(equipped) >= 2:
-                self.shop_notice = "LOADOUT IS FULL"
-                return
+            elif equipped:
+                equipped[:] = [skill]
+                self.shop_notice = f"EQUIPPED {SKILL_NAMES[skill]}"
             else:
                 equipped.append(skill)
                 self.shop_notice = f"EQUIPPED {SKILL_NAMES[skill]}"
@@ -1311,12 +1382,13 @@ class Game:
 
     def draw_lobby_mode_pick(self):
         self._draw_frontend_background(
-            "MODE SELECT", "Choose the ruleset for this session."
+            "MODE SELECT", "SESSION TYPE"
         )
-
-        title = self.font_xl.render("CHOOSE MODE", True, CYAN)
-        self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 5))
-
+        panel = pygame.Rect(W // 2 - 360, 150, 720, 560)
+        pygame.draw.rect(self.surf, (8, 16, 24), panel, border_radius=6)
+        pygame.draw.rect(self.surf, (31, 73, 86), panel, 2, border_radius=6)
+        title = self.font_xl.render("CHOOSE MODE", True, WHITE)
+        self.surf.blit(title, (panel.x + 38, panel.y + 35))
         descriptions = {
             "ESCAPE MODE":
                 "Co-op: all players race to escape the maze. Bot hunter.",
@@ -1327,34 +1399,17 @@ class Game:
         }
 
         self.mode_rects = []
-        opt_h   = 70
-        start_y = H // 2 - 40
-
+        start_y = panel.y + 145
         for i, label in enumerate(self.mode_options):
-            selected = (i == self.mode_index)
-            color    = CYAN if selected else WHITE
-            text     = self.font_lg.render(label, True, color)
-            tw, th   = text.get_size()
-            x = W // 2 - tw // 2
-            y = start_y + i * opt_h
-
-            rect = pygame.Rect(x - 20, y - 6, tw + 40, th + 12)
+            selected = i == self.mode_index
+            rect = pygame.Rect(panel.x + 42, start_y + i * 104,
+                               panel.width - 84, 58)
             self.mode_rects.append(rect)
-
-            if selected:
-                pygame.draw.rect(self.surf, (0, 60, 90), rect, border_radius=6)
-                pygame.draw.rect(self.surf, CYAN, rect, 2, border_radius=6)
-
-            self.surf.blit(text, (x, y))
-
+            self._draw_menu_option(label, rect, selected)
             desc = descriptions.get(label, "")
             if desc and selected:
-                d = self.font_sm.render(desc, True, (160, 160, 160))
-                self.surf.blit(d, (W // 2 - d.get_width() // 2, y + th + 14))
-
-        hint = self.font_sm.render("UP/DOWN/ENTER  -  ESC = back",
-                                   True, (120, 120, 120))
-        self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
+                d = self.font_tiny.render(desc, True, (124, 151, 163))
+                self.surf.blit(d, (rect.x + 18, rect.bottom + 8))
 
     def handle_lobby_click(self, pos):
         for i, rect in enumerate(self.lobby_rects):
@@ -1366,81 +1421,76 @@ class Game:
 
     def draw_lobby(self):
         self._draw_frontend_background(
-            "MULTIPLAYER", "Host a session or connect to another operative."
+            "MULTIPLAYER", "NETWORK OPERATIONS"
         )
-
-        title = self.font_xl.render("MULTIPLAYER", True, CYAN)
-        self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 5))
-
-        sub = self.font_sm.render("Host opens a server. Join connects to a host's Radmin IP.",
-                                  True, (160, 160, 160))
-        self.surf.blit(sub, (W // 2 - sub.get_width() // 2, H // 5 + 80))
-
+        panel = pygame.Rect(W // 2 - 340, 170, 680, 500)
+        pygame.draw.rect(self.surf, (8, 16, 24), panel, border_radius=6)
+        pygame.draw.rect(self.surf, (31, 73, 86), panel, 2, border_radius=6)
+        title = self.font_xl.render("MULTIPLAYER", True, WHITE)
+        self.surf.blit(title, (panel.x + 38, panel.y + 38))
         self.lobby_rects = []
-        opt_h   = 60
-        start_y = H // 2
-
+        start_y = panel.y + 150
         for i, label in enumerate(self.lobby_options):
-            selected = (i == self.lobby_index)
-            color    = CYAN if selected else WHITE
-            text     = self.font_lg.render(label, True, color)
-            tw, th   = text.get_size()
-            x = W // 2 - tw // 2
-            y = start_y + i * opt_h
-
-            rect = pygame.Rect(x - 20, y - 6, tw + 40, th + 12)
+            rect = pygame.Rect(
+                panel.x + 42, start_y + i * 76, panel.width - 84, 56
+            )
             self.lobby_rects.append(rect)
-
-            if selected:
-                pygame.draw.rect(self.surf, (0, 60, 90), rect, border_radius=6)
-                pygame.draw.rect(self.surf, CYAN, rect, 2, border_radius=6)
-
-            self.surf.blit(text, (x, y))
+            self._draw_menu_option(label, rect, i == self.lobby_index)
 
         if self.mp_status_msg:
             msg = self.font_sm.render(self.mp_status_msg, True, (255, 200, 80))
-            self.surf.blit(msg, (W // 2 - msg.get_width() // 2, H - 100))
-
-        hint = self.font_sm.render("UP/DOWN/ENTER  -  ESC = back", True, (120, 120, 120))
-        self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
+            self.surf.blit(
+                msg, (panel.centerx - msg.get_width() // 2, panel.bottom - 48)
+            )
 
     # ── lobby_join_input ──────────────────────────────────────────────────────
     def draw_lobby_join_input(self):
         self._draw_frontend_background(
-            "CONNECT", "Enter the host address to join the facility."
+            "CONNECT", "NETWORK SESSION"
         )
-
+        panel = pygame.Rect(W // 2 - 380, 190, 760, 430)
+        pygame.draw.rect(self.surf, (8, 16, 24), panel, border_radius=6)
+        pygame.draw.rect(self.surf, (31, 73, 86), panel, 2, border_radius=6)
         title = self.font_xl.render("JOIN GAME", True, CYAN)
-        self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 5))
+        self.surf.blit(title, (panel.x + 40, panel.y + 38))
+        prompt = self.font_sm.render("HOST ADDRESS", True, (120, 149, 163))
+        self.surf.blit(prompt, (panel.x + 42, panel.y + 130))
 
-        prompt = self.font_med.render("Enter host IP (Radmin VPN):", True, WHITE)
-        self.surf.blit(prompt, (W // 2 - prompt.get_width() // 2, H // 2 - 60))
-
-        # text box
-        box_w, box_h = 480, 60
-        bx = W // 2 - box_w // 2
-        by = H // 2
-        pygame.draw.rect(self.surf, (20, 30, 50), (bx, by, box_w, box_h),
-                         border_radius=6)
+        box_w, box_h = panel.width - 84, 60
+        bx = panel.x + 42
+        by = panel.y + 168
+        pygame.draw.rect(self.surf, (4, 9, 15), (bx, by, box_w, box_h),
+                         border_radius=5)
         pygame.draw.rect(self.surf, CYAN, (bx, by, box_w, box_h),
-                         2, border_radius=6)
+                         2, border_radius=5)
 
         txt = self.font_lg.render(self.mp_text_input + "_", True, WHITE)
         self.surf.blit(txt, (bx + 14, by + (box_h - txt.get_height()) // 2))
 
-        port_hint = self.font_sm.render(
-            f"Port: {network.DEFAULT_PORT}  -  e.g. 26.123.45.6",
-            True, (160, 160, 160))
-        self.surf.blit(port_hint, (W // 2 - port_hint.get_width() // 2,
-                                   H // 2 + box_h + 14))
+        port_hint = self.font_tiny.render(
+            f"PORT {network.DEFAULT_PORT}", True, (112, 143, 156)
+        )
+        self.surf.blit(port_hint, (bx, by + box_h + 12))
 
         if self.mp_status_msg:
             msg = self.font_sm.render(self.mp_status_msg, True, (255, 120, 120))
-            self.surf.blit(msg, (W // 2 - msg.get_width() // 2,
-                                 H // 2 + box_h + 50))
+            self.surf.blit(msg, (bx, by + box_h + 43))
 
-        hint = self.font_sm.render("ENTER = connect  -  ESC = back", True, (120, 120, 120))
-        self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
+        self.join_connect_rect = pygame.Rect(
+            panel.centerx - 150, panel.bottom - 76, 300, 48
+        )
+        pygame.draw.rect(
+            self.surf, (14, 46, 43),
+            self.join_connect_rect, border_radius=5,
+        )
+        pygame.draw.rect(
+            self.surf, (70, 226, 211),
+            self.join_connect_rect, 2, border_radius=5,
+        )
+        connect = self.font_med.render("CONNECT", True, WHITE)
+        self.surf.blit(
+            connect, connect.get_rect(center=self.join_connect_rect.center)
+        )
 
     # ── ESCAPE-mode settings (host adjusts in the wait room) ──────────────────
     def _settings_value_str(self, key):
@@ -1463,34 +1513,51 @@ class Game:
             v = max(0, min(v + direction, max_bots))
             self.mp_settings[key] = v
 
+    def _start_waiting_match(self):
+        if self.server is None:
+            return
+        if self.mp_mode == "dbd":
+            self.state = "lobby_map_vote"
+            self.mp_vote_timer = 15.0
+            self.mp_map_votes = {}
+            self.server.broadcast({"type": "start_vote"})
+        else:
+            self.host_start_match()
+
     # ── lobby_wait (host or client waiting room) ──────────────────────────────
     def draw_lobby_wait(self):
         self._draw_frontend_background(
-            "READY ROOM", "Configure the match while players connect."
+            "READY ROOM", "SESSION CONFIGURATION"
         )
-
+        panel = pygame.Rect(W // 2 - 430, 140, 860, 610)
+        pygame.draw.rect(self.surf, (8, 16, 24), panel, border_radius=6)
+        pygame.draw.rect(
+            self.surf, (31, 73, 86), panel, 2, border_radius=6
+        )
+        self.setting_click_rects = []
+        self.lobby_start_rect = None
         if self.server is not None:
-            title = self.font_xl.render("HOSTING", True, CYAN)
-            self.surf.blit(title, (W // 2 - title.get_width() // 2, 60))
-
             mode_label = {
                 "escape": "ESCAPE MODE",
                 "dbd":    "DBD-MAZE",
             }.get(self.mp_mode, self.mp_mode.upper())
-            mode_text = self.font_med.render(f"Mode: {mode_label}",
-                                             True, (255, 220, 80))
-            self.surf.blit(mode_text,
-                           (W // 2 - mode_text.get_width() // 2, 140))
-
-            ip_hint = self.font_sm.render(
-                f"Share your Radmin IP with players  -  Port {self.server.port}",
-                True, (160, 160, 160))
-            self.surf.blit(ip_hint, (W // 2 - ip_hint.get_width() // 2, 190))
-
             n = self.server.count()
-            count = self.font_lg.render(f"Players: {n + 1} / {network.MAX_PLAYERS}",
-                                        True, WHITE)
-            self.surf.blit(count, (W // 2 - count.get_width() // 2, 240))
+            title = self.font_xl.render("HOSTING", True, CYAN)
+            self.surf.blit(title, (panel.x + 40, panel.y + 32))
+            mode_text = self.font_med.render(
+                mode_label, True, (239, 205, 71)
+            )
+            self.surf.blit(mode_text, (panel.x + 44, panel.y + 106))
+            count = self.font_med.render(
+                f"PLAYERS  {n + 1}/{network.MAX_PLAYERS}", True, WHITE
+            )
+            self.surf.blit(count, (panel.right - count.get_width() - 44,
+                                   panel.y + 48))
+            port = self.font_tiny.render(
+                f"PORT {self.server.port}", True, (112, 143, 156)
+            )
+            self.surf.blit(port, (panel.right - port.get_width() - 44,
+                                  panel.y + 112))
 
             # host-decided settings
             active_rows = ["PORTALS", "MAZE SHIFT", "HUNTER"] if self.mp_mode == "escape" else ["BOT RUNNERS"]
@@ -1498,11 +1565,12 @@ class Game:
             if self.settings_index >= len(self.settings_rows):
                 self.settings_index = 0
 
-            head = self.font_med.render("SETTINGS", True, WHITE)
-            self.surf.blit(head, (W // 2 - head.get_width() // 2, 320))
-
-            row_h = 50
-            start_y = 370
+            head = self.font_tiny.render(
+                "MATCH SETTINGS", True, (112, 143, 156)
+            )
+            self.surf.blit(head, (panel.x + 44, panel.y + 178))
+            row_h = 76
+            start_y = panel.y + 214
             for i, key_name in enumerate(self.settings_rows):
                 key  = key_name.lower().replace(" ", "_")
                 val  = self._settings_value_str(key)
@@ -1511,85 +1579,153 @@ class Game:
                     if self.mp_settings[key] > max_bots:
                         self.mp_settings[key] = max_bots
                         val = str(max_bots)
-                sel  = (i == self.settings_index)
-                col  = CYAN if sel else WHITE
-                text = self.font_med.render(f"{key_name:<12s}  <  {val}  >", True, col)
-                tw, th = text.get_size()
-                x = W // 2 - tw // 2
                 y = start_y + i * row_h
-                if sel:
-                    pygame.draw.rect(self.surf, (0, 60, 90), (x - 16, y - 4, tw + 32, th + 8), border_radius=4)
-                self.surf.blit(text, (x, y))
+                row = pygame.Rect(panel.x + 42, y, panel.width - 84, 58)
+                selected = i == self.settings_index
+                pygame.draw.rect(
+                    self.surf,
+                    (13, 29, 38) if selected else (10, 20, 29),
+                    row, border_radius=5,
+                )
+                pygame.draw.rect(
+                    self.surf,
+                    (70, 226, 211) if selected else (31, 62, 74),
+                    row, 2 if selected else 1, border_radius=5,
+                )
+                label = self.font_sm.render(key_name, True, WHITE)
+                self.surf.blit(
+                    label, (row.x + 18, row.centery - label.get_height() // 2)
+                )
+                left = pygame.Rect(row.right - 220, row.y + 8, 42, 42)
+                right = pygame.Rect(row.right - 52, row.y + 8, 42, 42)
+                for button, symbol in ((left, "<"), (right, ">")):
+                    pygame.draw.rect(
+                        self.surf, (18, 36, 46), button, border_radius=4
+                    )
+                    pygame.draw.rect(
+                        self.surf, (70, 226, 211), button, 1, border_radius=4
+                    )
+                    glyph = self.font_med.render(symbol, True, WHITE)
+                    self.surf.blit(glyph, glyph.get_rect(center=button.center))
+                value = self.font_med.render(val, True, (239, 205, 71))
+                self.surf.blit(
+                    value,
+                    value.get_rect(center=(row.right - 115, row.centery)),
+                )
+                self.setting_click_rects.append((key, left, right))
 
-            hint1 = self.font_sm.render(
-                "UP/DOWN: select  -  LEFT/RIGHT: change value",
-                True, (160, 160, 160))
-            self.surf.blit(hint1, (W // 2 - hint1.get_width() // 2,
-                                   start_y + len(self.settings_rows) * row_h + 30))
-
-            hint = self.font_med.render("SPACE = start  -  ESC = cancel",
-                                        True, (200, 200, 200))
-            self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 90))
+            self.lobby_start_rect = pygame.Rect(
+                panel.centerx - 170, panel.bottom - 78, 340, 50
+            )
+            pygame.draw.rect(
+                self.surf, (14, 46, 43),
+                self.lobby_start_rect, border_radius=5,
+            )
+            pygame.draw.rect(
+                self.surf, (70, 226, 211),
+                self.lobby_start_rect, 2, border_radius=5,
+            )
+            start_text = self.font_med.render("START MATCH", True, WHITE)
+            self.surf.blit(
+                start_text,
+                start_text.get_rect(center=self.lobby_start_rect.center),
+            )
 
         elif self.client is not None:
             title = self.font_xl.render("CONNECTED", True, CYAN)
-            self.surf.blit(title, (W // 2 - title.get_width() // 2, H // 5))
-
-            wait = self.font_lg.render(f"You are PLAYER {self.player_id + 1}",
-                                       True, PLAYER_COLORS[self.player_id])
-            self.surf.blit(wait, (W // 2 - wait.get_width() // 2, H // 2 - 30))
-
-            msg = self.font_med.render("Waiting for host to press SPACE...",
-                                       True, (200, 200, 200))
-            self.surf.blit(msg, (W // 2 - msg.get_width() // 2, H // 2 + 40))
-
-            hint = self.font_sm.render("ESC = disconnect", True, (120, 120, 120))
-            self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
+            self.surf.blit(title, (panel.x + 44, panel.y + 44))
+            wait = self.font_lg.render(
+                f"PLAYER {self.player_id + 1}",
+                True, PLAYER_COLORS[self.player_id],
+            )
+            self.surf.blit(wait, wait.get_rect(center=panel.center))
+            msg = self.font_med.render(
+                "WAITING FOR HOST", True, (178, 197, 205)
+            )
+            self.surf.blit(
+                msg, msg.get_rect(center=(panel.centerx, panel.centery + 70))
+            )
 
 
     def draw_lobby_map_vote(self):
         self._draw_frontend_background(
-            "MAP VOTE", "Select the facility layout."
+            "MAP VOTE", "FACILITY SELECTION"
         )
-        title = self.font_xl.render("VOTE MAP", True, CYAN)
-        self.surf.blit(title, (W // 2 - title.get_width() // 2, 60))
-
+        panel = pygame.Rect(W // 2 - 390, 135, 780, 620)
+        pygame.draw.rect(self.surf, (8, 16, 24), panel, border_radius=6)
+        pygame.draw.rect(self.surf, (31, 73, 86), panel, 2, border_radius=6)
+        title = self.font_xl.render("VOTE MAP", True, WHITE)
+        self.surf.blit(title, (panel.x + 38, panel.y + 35))
         time_left = max(0, int(self.mp_vote_timer))
-        time_text = self.font_lg.render(f"Time: {time_left}s", True, (255, 100, 100) if time_left <= 5 else WHITE)
-        self.surf.blit(time_text, (W // 2 - time_text.get_width() // 2, 120))
-
-        opt_h = 50
-        start_y = 220
+        time_text = self.font_lg.render(
+            f"{time_left}s", True,
+            (255, 100, 100) if time_left <= 5 else (239, 205, 71),
+        )
+        self.surf.blit(
+            time_text, (panel.right - time_text.get_width() - 42, panel.y + 46)
+        )
+        start_y = panel.y + 140
         # Calculate votes
         vote_counts = [0] * len(self.mp_vote_options)
         for v in self.mp_map_votes.values():
             if 0 <= v < len(vote_counts):
                 vote_counts[v] += 1
 
+        self.map_vote_rects = []
         for i, label in enumerate(self.mp_vote_options):
             selected = (i == self.mp_vote_index)
-            color = CYAN if selected else WHITE
             vc = vote_counts[i]
-            text = self.font_med.render(f"{label} ({vc} votes)", True, color)
-            tw, th = text.get_size()
-            x = W // 2 - tw // 2
-            y = start_y + i * opt_h
-
-            if selected:
-                pygame.draw.rect(self.surf, (0, 60, 90), (x - 20, y - 6, tw + 40, th + 12), border_radius=6)
-                pygame.draw.rect(self.surf, CYAN, (x - 20, y - 6, tw + 40, th + 12), 2, border_radius=6)
-
-            self.surf.blit(text, (x, y))
+            rect = pygame.Rect(
+                panel.x + 42, start_y + i * 92, panel.width - 84, 58
+            )
+            self.map_vote_rects.append(rect)
+            self._draw_menu_option(f"{label}   {vc} VOTES", rect, selected)
 
             # Draw who voted for this
             voters = [str(pid+1) if pid > 0 else "HOST" for pid, v in self.mp_map_votes.items() if v == i]
             if voters:
-                v_text = self.font_sm.render(", ".join(voters), True, (160, 160, 160))
-                self.surf.blit(v_text, (x + tw + 30, y + th//2 - v_text.get_height()//2))
+                v_text = self.font_tiny.render(
+                    ", ".join(voters), True, (124, 151, 163)
+                )
+                self.surf.blit(v_text, (rect.x + 20, rect.bottom + 5))
 
-        hint = self.font_sm.render("UP/DOWN: change  -  ENTER: confirm vote", True, (160, 160, 160))
-        self.surf.blit(hint, (W // 2 - hint.get_width() // 2, H - 60))
 
+    def _register_click(self, pos):
+        self.click_effects.append({
+            "x": int(pos[0]),
+            "y": int(pos[1]),
+            "age": 0.0,
+            "duration": 0.32,
+        })
+
+    def _update_click_effects(self, dt):
+        active = []
+        for effect in self.click_effects:
+            effect["age"] += dt
+            if effect["age"] < effect["duration"]:
+                active.append(effect)
+        self.click_effects = active
+
+    def _draw_click_effects(self):
+        for effect in self.click_effects:
+            progress = effect["age"] / effect["duration"]
+            radius = int(5 + 24 * progress)
+            alpha = max(0, int(230 * (1.0 - progress)))
+            size = radius * 2 + 8
+            ripple = pygame.Surface((size, size), pygame.SRCALPHA)
+            center = size // 2
+            pygame.draw.circle(
+                ripple, (103, 241, 222, alpha // 3),
+                (center, center), max(3, radius // 2),
+            )
+            pygame.draw.circle(
+                ripple, (118, 255, 236, alpha),
+                (center, center), radius, 2,
+            )
+            self.surf.blit(
+                ripple,
+                (effect["x"] - center, effect["y"] - center),
+            )
 
     def _draw_frontend_background(self, section, subtitle=""):
         self.surf.fill((3, 7, 12))
@@ -1710,6 +1846,7 @@ class Game:
         name_label = self.font_sm.render("PLAYER NAME", True, (120, 149, 163))
         self.surf.blit(name_label, (panel.x + 44, panel.y + 42))
         name_box = pygame.Rect(panel.x + 44, panel.y + 82, 500, 62)
+        self.profile_name_rect = name_box
         pygame.draw.rect(self.surf, (4, 9, 15), name_box, border_radius=5)
         pygame.draw.rect(
             self.surf, (70, 226, 211), name_box, 2, border_radius=5
@@ -1754,8 +1891,21 @@ class Game:
             self.surf.blit(label_text, (row.x + 16, row.y + 9))
             self.surf.blit(number_text, (row.x + 16, row.y + 27))
 
-        hint = self.font_sm.render("SAVE NAME", True, (130, 157, 169))
-        self.surf.blit(hint, (panel.x + 44, panel.bottom - 52))
+        self.profile_save_rect = pygame.Rect(
+            panel.x + 44, panel.bottom - 76, 220, 48
+        )
+        pygame.draw.rect(
+            self.surf, (13, 29, 37),
+            self.profile_save_rect, border_radius=5,
+        )
+        pygame.draw.rect(
+            self.surf, (70, 226, 211),
+            self.profile_save_rect, 2, border_radius=5,
+        )
+        save_text = self.font_sm.render("SAVE NAME", True, WHITE)
+        self.surf.blit(
+            save_text, save_text.get_rect(center=self.profile_save_rect.center)
+        )
 
     def draw_daily(self):
         self._draw_frontend_background(
@@ -1820,10 +1970,19 @@ class Game:
         self.shop_rects = []
         grid_x = 70
         grid_y = 230
+        card_w = 185
+        card_h = 78
+        card_gap_x = 15
+        card_gap_y = 20
         for index, skill in enumerate(skills):
-            row = index % 4
-            col = index // 4
-            rect = pygame.Rect(grid_x + col * 300, grid_y + row * 98, 270, 78)
+            row = index // 2
+            col = index % 2
+            rect = pygame.Rect(
+                grid_x + col * (card_w + card_gap_x),
+                grid_y + row * (card_h + card_gap_y),
+                card_w,
+                card_h,
+            )
             self.shop_rects.append(rect)
             selected = index == self.shop_index
             owned = skill in self.profile["owned_skills"]
@@ -1835,14 +1994,32 @@ class Game:
             )
             icon = self.skill_icons.get(skill)
             if icon is not None:
-                self.surf.blit(icon, icon.get_rect(center=(rect.x + 45, rect.centery)))
+                shown = pygame.transform.smoothscale(icon, (42, 42))
+                self.surf.blit(
+                    shown, shown.get_rect(center=(rect.x + 32, rect.centery))
+                )
             label = self.font_sm.render(SKILL_NAMES[skill], True, WHITE)
-            self.surf.blit(label, (rect.x + 82, rect.y + 13))
-            state = "OWNED" if owned else f"{progression.SKILL_PRICES[skill]} C"
+            self.surf.blit(label, (rect.x + 61, rect.y + 13))
+            tab = self.shop_tabs[self.shop_tab]
+            if tab == "BUY":
+                state = "PURCHASED" if owned \
+                    else f"{progression.SKILL_PRICES[skill]} C"
+            elif tab == "UPGRADE":
+                state = (
+                    f"LEVEL {self.profile['skill_levels'].get(skill, 1)}"
+                    if owned else "LOCKED"
+                )
+            else:
+                state = (
+                    "EQUIPPED"
+                    if skill in self.profile["equipped_skills"]
+                    else "AVAILABLE"
+                )
             state_text = self.font_tiny.render(
-                state, True, color if owned else (239, 205, 71)
+                state, True,
+                color if owned else (122, 143, 153),
             )
-            self.surf.blit(state_text, (rect.x + 82, rect.y + 46))
+            self.surf.blit(state_text, (rect.x + 61, rect.y + 46))
 
         skill = self._shop_selected_skill()
         if skill is not None:
@@ -1873,20 +2050,52 @@ class Game:
 
             tab = self.shop_tabs[self.shop_tab]
             if tab == "BUY":
-                action = "PURCHASE"
+                action = "PURCHASED" if skill in \
+                    self.profile["owned_skills"] else "PURCHASE"
             elif tab == "UPGRADE":
                 price = progression.skill_upgrade_price(skill, level)
-                action = "MAX LEVEL" if price is None else f"UPGRADE {price} C"
+                if skill not in self.profile["owned_skills"]:
+                    action = "BUY SKILL FIRST"
+                else:
+                    action = (
+                        "MAX LEVEL"
+                        if price is None else f"UPGRADE {price} C"
+                    )
             else:
                 equipped = skill in self.profile["equipped_skills"]
                 action = "UNEQUIP" if equipped else "EQUIP"
-            action_text = self.font_med.render(
-                action, True, (239, 205, 71)
+            self.shop_action_rect = pygame.Rect(
+                detail.x + 28, detail.bottom - 72,
+                detail.width - 56, 46,
             )
+            action_enabled = not (
+                (tab == "BUY" and skill in self.profile["owned_skills"])
+                or (
+                    tab == "UPGRADE"
+                    and (
+                    skill not in self.profile["owned_skills"]
+                    or progression.skill_upgrade_price(skill, level) is None
+                    )
+                )
+            )
+            action_color = (
+                (239, 205, 71) if action_enabled else (77, 91, 99)
+            )
+            pygame.draw.rect(
+                self.surf, (18, 24, 30),
+                self.shop_action_rect, border_radius=5,
+            )
+            pygame.draw.rect(
+                self.surf, action_color,
+                self.shop_action_rect, 2, border_radius=5,
+            )
+            action_text = self.font_med.render(action, True, action_color)
             self.surf.blit(
                 action_text,
-                (detail.x + 28, detail.bottom - action_text.get_height() - 28),
+                action_text.get_rect(center=self.shop_action_rect.center),
             )
+        else:
+            self.shop_action_rect = None
 
         if self.shop_notice:
             notice = self.font_sm.render(
@@ -1977,6 +2186,7 @@ class Game:
         self.mp_orb_timer = 0.0
         self.mp_winner       = ""
         self.mp_match_rewarded = False
+        self.mp_reward_summary = {}
         self.mp_network_profiles = {
             0: progression.network_profile(self.profile)
         }
@@ -1989,18 +2199,14 @@ class Game:
     def _initialize_dbd_player(self, p):
         profile = self.mp_network_profiles.get(p["id"], {})
         if p.get("is_bot"):
-            equipped = random.sample(
-                list(RANDOM_SKILLS), min(2, len(RANDOM_SKILLS))
-            )
+            equipped = [random.choice(RANDOM_SKILLS)]
             skill_levels = {skill: 1 for skill in progression.SKILL_ORDER}
             player_name = ""
         else:
             equipped = [
                 skill for skill in profile.get("equipped_skills", [])
                 if skill in progression.LOADOUT_SKILLS
-            ][:2]
-            if not equipped:
-                equipped = ["speed"]
+            ][:1]
             skill_levels = {
                 skill: max(
                     1, min(
@@ -2012,11 +2218,11 @@ class Game:
             }
             player_name = progression.sanitize_name(profile.get("name", ""))
 
-        skills = (
-            ["trap"] + equipped[:1]
-            if p.get("role") == "hunter"
-            else equipped[:2]
+        persistent_skill = (
+            "trap" if p.get("role") == "hunter"
+            else (equipped[0] if equipped else None)
         )
+        skills = [persistent_skill] if persistent_skill else []
         charges = {
             skill: 1 + max(0, skill_levels.get(skill, 1) - 1) // 2
             for skill in skills
@@ -2045,9 +2251,16 @@ class Game:
             "aim_c": float(p["c"] + 1),
             "selected_skill": 0,
             "skills": skills,
+            "persistent_skill": persistent_skill,
+            "temporary_skills": [],
             "skill_levels": skill_levels,
             "skill_charges": charges,
             "skill_cooldowns": {skill: 0.0 for skill in skills},
+            "match_time": 0.0,
+            "match_generators": 0,
+            "match_rescues": 0,
+            "match_downs": 0,
+            "match_skill_hits": 0,
         })
 
     def _assign_default_player_names(self):
@@ -2099,6 +2312,7 @@ class Game:
             SKILL_ORB_SPAWN_MIN, SKILL_ORB_SPAWN_MAX
         )
         self.mp_match_rewarded = False
+        self.mp_reward_summary = {}
 
     def _spawn_skill_orb(self):
         taken = {
@@ -2212,7 +2426,7 @@ class Game:
             self.mp_generators.append(Generator(cell[0], cell[1]))
         for cell in pod_pos:
             self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
-        self.mp_skill_orbs = []
+        self._seed_skill_orbs()
             
         self.state = "mp_play"
         self.server.broadcast({"type": "start", **self._serialize_state()})
@@ -2310,7 +2524,7 @@ class Game:
                 if cell is None: break
                 taken.append(cell)
                 self.mp_freezing_pods.append(FreezingPod(cell[0], cell[1]))
-            self.mp_skill_orbs = []
+            self._seed_skill_orbs()
             # DBD-MAZE: no portals
             self.portals = []
 
@@ -3384,9 +3598,12 @@ class Game:
         runner["trap_checks_remaining"] = 0
         runner["ai_state"] = "idle"
         runner["ai_target_pos"] = None
+        hunter["match_downs"] = hunter.get("match_downs", 0) + 1
 
     @staticmethod
     def _skill_level(p, skill):
+        if skill in p.get("temporary_skills", []):
+            return 1
         return max(1, int(p.get("skill_levels", {}).get(skill, 1)))
 
     def _skill_max_charges(self, p, skill):
@@ -3406,6 +3623,16 @@ class Game:
         if not (0 <= index < len(skills)):
             return
         skill = skills[index]
+        if skill != p.get("persistent_skill"):
+            skills.pop(index)
+            if skill in p.get("temporary_skills", []):
+                p["temporary_skills"].remove(skill)
+            p.get("skill_charges", {}).pop(skill, None)
+            p.get("skill_cooldowns", {}).pop(skill, None)
+            p["selected_skill"] = min(
+                p.get("selected_skill", 0), max(0, len(skills) - 1)
+            )
+            return
         charges = p.setdefault("skill_charges", {})
         cooldowns = p.setdefault("skill_cooldowns", {})
         charges[skill] = max(0, charges.get(skill, 0) - 1)
@@ -3416,7 +3643,8 @@ class Game:
     def _update_skill_cooldowns(self, p, dt):
         charges = p.setdefault("skill_charges", {})
         cooldowns = p.setdefault("skill_cooldowns", {})
-        for skill in p.get("skills", []):
+        persistent = p.get("persistent_skill")
+        for skill in ([persistent] if persistent else []):
             maximum = self._skill_max_charges(p, skill)
             charges[skill] = min(maximum, max(0, charges.get(skill, maximum)))
             if charges[skill] >= maximum:
@@ -3556,6 +3784,8 @@ class Game:
                     target.get("blind_remaining", 0.0),
                     blind_time,
                 )
+                owner["match_skill_hits"] = \
+                    owner.get("match_skill_hits", 0) + 1
 
     def _update_explosions(self, dt):
         active = []
@@ -3649,6 +3879,8 @@ class Game:
                                         )
                                     ),
                                 )
+                                owner["match_skill_hits"] = \
+                                    owner.get("match_skill_hits", 0) + 1
                                 finished = True
                                 break
                     if outside:
@@ -3689,6 +3921,16 @@ class Game:
             triggered["trapped"] = True
             triggered["trap_checks_remaining"] = TRAP_CHECK_COUNT
             self._reset_trap_check(triggered)
+            owner = next(
+                (
+                    p for p in self.mp_players
+                    if p["id"] == trap.get("owner_id")
+                ),
+                None,
+            )
+            if owner is not None:
+                owner["match_skill_hits"] = \
+                    owner.get("match_skill_hits", 0) + 1
         self.mp_traps = remaining_traps
 
         for p in self.mp_players:
@@ -3750,13 +3992,27 @@ class Game:
             if collector is None:
                 remaining.append(orb)
                 continue
-            collector.setdefault("skills", []).append(
-                random.choice(RANDOM_SKILLS)
-            )
+            choices = [
+                skill for skill in RANDOM_SKILLS
+                if skill != collector.get("persistent_skill")
+                and skill not in collector.get("skills", [])
+            ]
+            if not choices:
+                remaining.append(orb)
+                continue
+            skill = random.choice(choices)
+            collector.setdefault("temporary_skills", []).append(skill)
+            collector.setdefault("skills", []).append(skill)
+            collector.setdefault("skill_charges", {})[skill] = 1
+            collector.setdefault("skill_cooldowns", {})[skill] = 0.0
         self.mp_skill_orbs = remaining
 
     def _dbd_tick(self, dt):
         """Generators, catches, imprisonment, rescues, win conditions."""
+        for p in self.mp_players:
+            if p["alive"] and not p.get("escaped"):
+                p["match_time"] = p.get("match_time", 0.0) + dt
+
         # match timer
         self.mp_match_timer -= dt
         if self.mp_match_timer <= 0:
@@ -3792,6 +4048,7 @@ class Game:
         self._update_projectiles(dt)
         self._update_explosions(dt)
         self._update_traps(dt, skill_presses)
+        self._update_skill_orbs(dt)
 
         # Generators: repair speed stacks; one shared skill check can interrupt it.
         for gen in self.mp_generators:
@@ -3858,6 +4115,9 @@ class Game:
                     gen.progress = GEN_REPAIR_TIME
                     gen.completed = True
                     gen.skill_active = False
+                    for repairer in repairers:
+                        repairer["match_generators"] = \
+                            repairer.get("match_generators", 0) + 1
                 elif not gen.skill_active:
                     gen.skill_cooldown -= dt
                     if gen.skill_cooldown <= 0:
@@ -3901,7 +4161,7 @@ class Game:
                 if w.is_adjacent(p["r"], p["c"]):
                     inp = self.mp_pending_input.get(p["id"], {})
                     if inp.get("e_held"):
-                        self._free_runner(w)
+                        self._free_runner(w, p)
                         break
 
         # imprisonment timers
@@ -3957,7 +4217,8 @@ class Game:
         runner["imprison_remaining"] = FREEZING_POD_IMPRISON
         w.imprisoned_pid = runner["id"]
 
-    def _free_runner(self, w):
+    def _free_runner(self, w, rescuer=None):
+        freed = False
         for p in self.mp_players:
             if p["id"] == w.imprisoned_pid:
                 p["imprisoned"] = False
@@ -3968,8 +4229,11 @@ class Game:
                     if not is_wall(self.walls, nr, nc, self.gates):
                         p["r"], p["c"] = nr, nc
                         break
+                freed = True
                 break
         w.imprisoned_pid = None
+        if freed and rescuer is not None:
+            rescuer["match_rescues"] = rescuer.get("match_rescues", 0) + 1
 
     def _end_dbd(self, winner):
         self.mp_winner = winner
@@ -4517,6 +4781,19 @@ class Game:
                     charge_text,
                     (rect.right - charge_text.get_width() - 5, rect.bottom - 20),
                 )
+                if skill in me.get("temporary_skills", []):
+                    temp = self.font_tiny.render(
+                        "ORB", True, (8, 12, 18)
+                    )
+                    badge = pygame.Rect(
+                        rect.x + 5, rect.bottom - 22, 28, 17
+                    )
+                    pygame.draw.rect(
+                        self.surf, (239, 205, 71), badge, border_radius=3
+                    )
+                    self.surf.blit(
+                        temp, temp.get_rect(center=badge.center)
+                    )
             if index == selected and skill:
                 key = self.font_tiny.render("F", True, (8, 12, 18))
                 badge = pygame.Rect(rect.x + 5, rect.y + 5, 19, 19)
@@ -4786,32 +5063,79 @@ class Game:
         elif self.mp_winner == "hunter":
             title  = "HUNTER WINS"
             color  = (255, 80, 80)
-            reason = "All runners were eliminated, frozen, or time expired."
+            reason = "All runners were frozen, eliminated, or ran out of time."
         else:
             title  = "MATCH OVER"
             color  = WHITE
             reason = ""
 
         # overlay box (bigger than the generic draw_overlay because we need buttons)
-        ow, oh = 760, 380
+        ow = min(820, MAZE_W - 36)
+        oh = min(560, MAZE_H - 36)
         ox = MAZE_OX + MAZE_W // 2 - ow // 2
         oy = MAZE_OY + MAZE_H // 2 - oh // 2
         panel = pygame.Surface((ow, oh), pygame.SRCALPHA)
-        panel.fill((0, 0, 0, 220))
+        panel.fill((7, 14, 22, 244))
         self.surf.blit(panel, (ox, oy))
-        pygame.draw.rect(self.surf, color, (ox, oy, ow, oh), 3)
+        pygame.draw.rect(
+            self.surf, (31, 73, 86),
+            (ox, oy, ow, oh), 2, border_radius=6,
+        )
+        pygame.draw.rect(
+            self.surf, color, (ox, oy, 7, oh), border_radius=3
+        )
 
         ts = self.font_xl.render(title, True, color)
-        self.surf.blit(ts, (ox + ow // 2 - ts.get_width() // 2, oy + 36))
+        self.surf.blit(ts, (ox + 38, oy + 22))
 
         if reason:
-            sub = self.font_med.render(reason, True, WHITE)
-            self.surf.blit(sub, (ox + ow // 2 - sub.get_width() // 2, oy + 140))
+            sub = self.font_sm.render(reason, True, (178, 199, 207))
+            self.surf.blit(sub, (ox + 42, oy + 82))
+
+        reward = self.mp_reward_summary
+        metrics = [
+            ("TIME", f"{reward.get('time', 0.0):.0f}s"),
+            ("GENERATORS", str(reward.get("generators", 0))),
+            ("RESCUES", str(reward.get("rescues", 0))),
+            ("DOWNS", str(reward.get("downs", 0))),
+            ("SKILL HITS", str(reward.get("skill_hits", 0))),
+            ("OUTCOME BONUS", str(reward.get("outcome_bonus", 0))),
+        ]
+        metric_gap = 14
+        metric_margin = 40
+        card_w = (
+            ow - metric_margin * 2 - metric_gap * 2
+        ) // 3
+        for index, (label, value) in enumerate(metrics):
+            col = index % 3
+            row = index // 3
+            card = pygame.Rect(
+                ox + metric_margin + col * (card_w + metric_gap),
+                oy + 124 + row * 68,
+                card_w,
+                54,
+            )
+            pygame.draw.rect(self.surf, (11, 21, 30), card, border_radius=5)
+            label_text = self.font_tiny.render(
+                label, True, (111, 141, 154)
+            )
+            value_text = self.font_med.render(value, True, WHITE)
+            self.surf.blit(label_text, (card.x + 14, card.y + 5))
+            self.surf.blit(value_text, (card.x + 14, card.y + 22))
+
+        reward_text = self.font_lg.render(
+            f"+{reward.get('coins', 0)} COINS   +{reward.get('xp', 0)} XP",
+            True, (239, 205, 71),
+        )
+        self.surf.blit(
+            reward_text,
+            (ox + ow // 2 - reward_text.get_width() // 2, oy + 270),
+        )
 
         # buttons
         self.mp_end_rects = {}
-        btn_w, btn_h = 240, 64
-        btn_y = oy + oh - btn_h - 50
+        btn_w, btn_h = 240, 52
+        btn_y = oy + oh - btn_h - 18
 
         if self.server is not None:
             # host: REPLAY + MENU side by side
@@ -4820,44 +5144,36 @@ class Game:
             bx_menu   = ox + ow // 2 + gap // 2
 
             replay_rect = pygame.Rect(bx_replay, btn_y, btn_w, btn_h)
-            pygame.draw.rect(self.surf, (0, 80, 40), replay_rect, border_radius=6)
-            pygame.draw.rect(self.surf, (80, 255, 80), replay_rect, 2, border_radius=6)
+            pygame.draw.rect(self.surf, (14, 46, 43), replay_rect, border_radius=5)
+            pygame.draw.rect(self.surf, (70, 226, 211), replay_rect, 2, border_radius=5)
             rt = self.font_med.render("REPLAY", True, WHITE)
             self.surf.blit(rt, (replay_rect.centerx - rt.get_width() // 2,
                                 replay_rect.centery - rt.get_height() // 2))
             self.mp_end_rects["replay"] = replay_rect
 
             menu_rect = pygame.Rect(bx_menu, btn_y, btn_w, btn_h)
-            pygame.draw.rect(self.surf, (40, 40, 60), menu_rect, border_radius=6)
-            pygame.draw.rect(self.surf, WHITE, menu_rect, 2, border_radius=6)
+            pygame.draw.rect(self.surf, (18, 25, 34), menu_rect, border_radius=5)
+            pygame.draw.rect(self.surf, (111, 137, 150), menu_rect, 2, border_radius=5)
             mt = self.font_med.render("MENU", True, WHITE)
             self.surf.blit(mt, (menu_rect.centerx - mt.get_width() // 2,
                                 menu_rect.centery - mt.get_height() // 2))
             self.mp_end_rects["menu"] = menu_rect
 
-            hint = self.font_sm.render(
-                "ENTER = replay  -  ESC = menu", True, (160, 160, 160))
-            self.surf.blit(hint,
-                           (ox + ow // 2 - hint.get_width() // 2, btn_y + btn_h + 10))
         else:
             # client: only MENU; show wait line
             wait = self.font_sm.render(
-                "Waiting for host... press REPLAY to play again.",
-                True, (180, 180, 180))
+                "WAITING FOR HOST", True, (178, 199, 207))
             self.surf.blit(wait,
                            (ox + ow // 2 - wait.get_width() // 2, btn_y - 28))
 
             menu_rect = pygame.Rect(ox + ow // 2 - btn_w // 2, btn_y, btn_w, btn_h)
-            pygame.draw.rect(self.surf, (40, 40, 60), menu_rect, border_radius=6)
-            pygame.draw.rect(self.surf, WHITE, menu_rect, 2, border_radius=6)
+            pygame.draw.rect(self.surf, (18, 25, 34), menu_rect, border_radius=5)
+            pygame.draw.rect(self.surf, (111, 137, 150), menu_rect, 2, border_radius=5)
             mt = self.font_med.render("MENU", True, WHITE)
             self.surf.blit(mt, (menu_rect.centerx - mt.get_width() // 2,
                                 menu_rect.centery - mt.get_height() // 2))
             self.mp_end_rects["menu"] = menu_rect
 
-            hint = self.font_sm.render("ESC = menu", True, (160, 160, 160))
-            self.surf.blit(hint,
-                           (ox + ow // 2 - hint.get_width() // 2, btn_y + btn_h + 10))
 
     def host_replay(self):
         """Host restarts the match with current mode + settings."""
@@ -4935,16 +5251,12 @@ class Game:
 
                     elif self.state == "profile":
                         if event.key == pygame.K_RETURN:
-                            self.profile["name"] = progression.sanitize_name(
-                                self.profile_name_input
-                            )
-                            self.profile_name_input = self.profile["name"]
-                            self.profile_editing = False
-                            self._save_profile()
-                        elif event.key == pygame.K_BACKSPACE:
+                            self._commit_profile_name()
+                        elif event.key == pygame.K_BACKSPACE \
+                                and self.profile_editing:
                             self.profile_name_input = \
                                 self.profile_name_input[:-1]
-                        elif event.unicode and not (
+                        elif self.profile_editing and event.unicode and not (
                                 pygame.key.get_mods() & pygame.KMOD_CTRL):
                             self.profile_name_input = \
                                 progression.sanitize_name(
@@ -5039,13 +5351,7 @@ class Game:
 
                     elif self.state == "lobby_wait_host":
                         if event.key == pygame.K_SPACE:
-                            if self.mp_mode == "dbd":
-                                self.state = "lobby_map_vote"
-                                self.mp_vote_timer = 15.0
-                                self.mp_map_votes = {}
-                                self.server.broadcast({"type": "start_vote"})
-                            else:
-                                self.host_start_match()
+                            self._start_waiting_match()
                         else:
                             if event.key in (pygame.K_UP, pygame.K_w):
                                 self.settings_index = \
@@ -5070,10 +5376,18 @@ class Game:
 
                 # mouse clicks
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    self._register_click(event.pos)
                     if self.state == "mp_play":
                         self.mp_attack_seq += 1
                     elif self.state == "menu":
                         self.handle_menu_click(event.pos)
+                    elif self.state == "profile":
+                        if self.profile_name_rect is not None \
+                                and self.profile_name_rect.collidepoint(event.pos):
+                            self.profile_editing = True
+                        elif self.profile_save_rect is not None \
+                                and self.profile_save_rect.collidepoint(event.pos):
+                            self._commit_profile_name()
                     elif self.state == "shop":
                         tab_clicked = False
                         for index, rect in enumerate(self.shop_tab_rects):
@@ -5088,12 +5402,48 @@ class Game:
                         for index, rect in enumerate(self.shop_rects):
                             if rect.collidepoint(event.pos):
                                 self.shop_index = index
-                                self._shop_action()
                                 break
+                        if self.shop_action_rect is not None \
+                                and self.shop_action_rect.collidepoint(event.pos):
+                            self._shop_action()
                     elif self.state == "lobby":
                         self.handle_lobby_click(event.pos)
+                    elif self.state == "lobby_join_input":
+                        if self.join_connect_rect is not None \
+                                and self.join_connect_rect.collidepoint(event.pos) \
+                                and self.mp_text_input.strip():
+                            self.start_client_mode(self.mp_text_input)
                     elif self.state == "lobby_mode_pick":
                         self.handle_mode_click(event.pos)
+                    elif self.state == "lobby_wait_host":
+                        handled = False
+                        for key, left, right in self.setting_click_rects:
+                            if left.collidepoint(event.pos):
+                                self.cycle_setting(key, -1)
+                                handled = True
+                                break
+                            if right.collidepoint(event.pos):
+                                self.cycle_setting(key, 1)
+                                handled = True
+                                break
+                        if not handled and self.lobby_start_rect is not None \
+                                and self.lobby_start_rect.collidepoint(event.pos):
+                            self._start_waiting_match()
+                    elif self.state == "lobby_map_vote":
+                        for index, rect in enumerate(self.map_vote_rects):
+                            if rect.collidepoint(event.pos):
+                                self.mp_vote_index = index
+                                self.mp_map_votes[self.player_id] = index
+                                if self.server:
+                                    self.server.broadcast({
+                                        "type": "votes_update",
+                                        "votes": self.mp_map_votes,
+                                    })
+                                elif self.client:
+                                    self.client.send({
+                                        "type": "vote", "vote": index
+                                    })
+                                break
                     elif self.state == "mp_end":
                         if "replay" in self.mp_end_rects \
                            and self.mp_end_rects["replay"].collidepoint(event.pos):
@@ -5331,6 +5681,8 @@ class Game:
                         (255, 70, 70),
                     )
 
+            self._update_click_effects(dt)
+            self._draw_click_effects()
             pygame.display.flip()
 
 

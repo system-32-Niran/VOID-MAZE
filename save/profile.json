@@ -1,0 +1,41 @@
+{
+  "economy_version": 2,
+  "name": "Nieh",
+  "coins": 216,
+  "xp": 44,
+  "level": 2,
+  "owned_skills": [],
+  "equipped_skills": [],
+  "skill_levels": {
+    "speed": 5,
+    "invisible": 1,
+    "phase": 1,
+    "spear": 1,
+    "flash": 3,
+    "teleport": 1,
+    "trap": 1
+  },
+  "stats": {
+    "matches": 2,
+    "escapes": 0,
+    "hunter_wins": 0,
+    "skills_used": 5
+  },
+  "daily": {
+    "date": "2026-06-19",
+    "missions": {
+      "matches": {
+        "progress": 1,
+        "claimed": true
+      },
+      "skills": {
+        "progress": 3,
+        "claimed": true
+      },
+      "escapes": {
+        "progress": 0,
+        "claimed": false
+      }
+    }
+  }
+}

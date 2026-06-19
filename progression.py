@@ -10,12 +10,12 @@ SKILL_ORDER = (
 LOADOUT_SKILLS = SKILL_ORDER[:-1]
 MAX_SKILL_LEVEL = 5
 SKILL_PRICES = {
-    "speed": 200,
-    "invisible": 300,
-    "phase": 350,
-    "spear": 400,
-    "flash": 300,
-    "teleport": 450,
+    "speed": 2000,
+    "invisible": 3000,
+    "phase": 3500,
+    "spear": 4000,
+    "flash": 3000,
+    "teleport": 4500,
     "trap": 0,
 }
 MISSION_DEFS = {
@@ -42,12 +42,13 @@ MISSION_DEFS = {
 
 def default_profile():
     return {
+        "economy_version": 2,
         "name": "",
-        "coins": 500,
+        "coins": 0,
         "xp": 0,
         "level": 1,
-        "owned_skills": ["speed", "flash", "trap"],
-        "equipped_skills": ["speed", "flash"],
+        "owned_skills": [],
+        "equipped_skills": [],
         "skill_levels": {skill: 1 for skill in SKILL_ORDER},
         "stats": {
             "matches": 0,
@@ -70,6 +71,13 @@ def _merge_profile(raw):
     if not isinstance(raw, dict):
         return profile
 
+    if raw.get("economy_version") != profile["economy_version"]:
+        raw = dict(raw)
+        raw["coins"] = 0
+        raw["owned_skills"] = []
+        raw["equipped_skills"] = []
+        raw["skill_levels"] = {}
+
     for key in ("name", "coins", "xp", "level"):
         if key in raw:
             profile[key] = raw[key]
@@ -79,15 +87,12 @@ def _merge_profile(raw):
         profile["owned_skills"] = [
             skill for skill in SKILL_ORDER if skill in owned
         ]
-    if "trap" not in profile["owned_skills"]:
-        profile["owned_skills"].append("trap")
-
     equipped = raw.get("equipped_skills")
     if isinstance(equipped, list):
         profile["equipped_skills"] = [
             skill for skill in equipped
             if skill in LOADOUT_SKILLS and skill in profile["owned_skills"]
-        ][:2]
+        ][:1]
 
     levels = raw.get("skill_levels", {})
     if isinstance(levels, dict):
@@ -169,7 +174,7 @@ def add_mission_progress(profile, mission_key, amount=1):
 def network_profile(profile):
     return {
         "name": sanitize_name(profile.get("name", "")),
-        "equipped_skills": list(profile.get("equipped_skills", []))[:2],
+        "equipped_skills": list(profile.get("equipped_skills", []))[:1],
         "skill_levels": copy.deepcopy(profile.get("skill_levels", {})),
     }
 
@@ -177,5 +182,5 @@ def network_profile(profile):
 def skill_upgrade_price(skill, current_level):
     if current_level >= MAX_SKILL_LEVEL:
         return None
-    return 140 + current_level * 110 + SKILL_ORDER.index(skill) * 15
-
+    return 900 + current_level * current_level * 550 \
+        + SKILL_ORDER.index(skill) * 175
