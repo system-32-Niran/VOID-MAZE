@@ -712,6 +712,7 @@ class Game:
         self.profile_name_rect = None
         self.join_connect_rect = None
         self.setting_click_rects = []
+        self.setting_row_rects = []
         self.lobby_start_rect = None
         self.map_vote_rects = []
         self.click_effects = []
@@ -794,6 +795,7 @@ class Game:
         self.mp_network_profiles = {
             0: progression.network_profile(self.profile)
         }
+        self.mp_lobby_bot_count = 0
         self.mp_match_rewarded = False
         self.mp_reward_summary = {}
         self.mp_match_timer  = 0.0    # countdown seconds remaining in DBD match
@@ -1411,6 +1413,13 @@ class Game:
                 return True
         return False
 
+    def handle_mode_hover(self, pos):
+        for index, rect in enumerate(self.mode_rects):
+            if rect.collidepoint(pos):
+                self.mode_index = index
+                return True
+        return False
+
     def draw_lobby_mode_pick(self):
         self._draw_frontend_background(
             "MODE SELECT", "SESSION TYPE"
@@ -1447,6 +1456,27 @@ class Game:
             if rect.collidepoint(pos):
                 self.lobby_index = i
                 self.select_lobby_option()
+                return True
+        return False
+
+    def handle_lobby_hover(self, pos):
+        for index, rect in enumerate(self.lobby_rects):
+            if rect.collidepoint(pos):
+                self.lobby_index = index
+                return True
+        return False
+
+    def handle_map_vote_hover(self, pos):
+        for index, rect in enumerate(self.map_vote_rects):
+            if rect.collidepoint(pos):
+                self.mp_vote_index = index
+                return True
+        return False
+
+    def handle_setting_hover(self, pos):
+        for index, rect in enumerate(self.setting_row_rects):
+            if rect.collidepoint(pos):
+                self.settings_index = index
                 return True
         return False
 
@@ -1543,6 +1573,62 @@ class Game:
             max_bots = max(0, network.MAX_PLAYERS - self.server.count() - 1)
             v = max(0, min(v + direction, max_bots))
             self.mp_settings[key] = v
+        self._broadcast_lobby_state()
+
+    def _lobby_state_payload(self):
+        if self.server is not None:
+            max_bots = max(
+                0, network.MAX_PLAYERS - self.server.count() - 1
+            )
+            self.mp_settings["bot_runners"] = min(
+                self.mp_settings.get("bot_runners", 0), max_bots
+            )
+            self.mp_lobby_bot_count = (
+                self.mp_settings.get("bot_runners", 0)
+                if self.mp_mode == "dbd" else 0
+            )
+        profiles = []
+        for player_id, profile in sorted(self.mp_network_profiles.items()):
+            name = progression.sanitize_name(profile.get("name", ""))
+            if not name:
+                name = "HOST" if player_id == 0 else f"PLAYER {player_id + 1}"
+            profiles.append({"id": player_id, "name": name})
+        return {
+            "type": "lobby_state",
+            "mode": self.mp_mode,
+            "profiles": profiles,
+            "bot_runners": self.mp_lobby_bot_count,
+        }
+
+    def _broadcast_lobby_state(self):
+        if self.server is not None:
+            self.server.broadcast(self._lobby_state_payload())
+
+    def _apply_lobby_state(self, msg):
+        self.mp_mode = msg.get("mode", self.mp_mode)
+        self.mp_lobby_bot_count = max(
+            0, int(msg.get("bot_runners", 0))
+        )
+        profiles = {}
+        for entry in msg.get("profiles", []):
+            try:
+                player_id = int(entry.get("id", 0))
+            except (TypeError, ValueError):
+                continue
+            profiles[player_id] = {
+                "name": progression.sanitize_name(entry.get("name", ""))
+            }
+        if profiles:
+            self.mp_network_profiles = profiles
+
+    def _lobby_roster(self):
+        entries = []
+        for player_id, profile in sorted(self.mp_network_profiles.items()):
+            name = progression.sanitize_name(profile.get("name", ""))
+            if not name:
+                name = "HOST" if player_id == 0 else f"PLAYER {player_id + 1}"
+            entries.append((player_id, name))
+        return entries
 
     def _start_waiting_match(self):
         if self.server is None:
@@ -1551,7 +1637,7 @@ class Game:
             self.state = "lobby_map_vote"
             self.mp_vote_timer = 15.0
             self.mp_map_votes = {}
-            self.server.broadcast({"type": "start_vote"})
+            self.server.broadcast({"type": "start_vote", "timer": 15.0})
         else:
             self.host_start_match()
 
@@ -1566,52 +1652,116 @@ class Game:
             self.surf, (31, 73, 86), panel, 2, border_radius=6
         )
         self.setting_click_rects = []
+        self.setting_row_rects = []
         self.lobby_start_rect = None
-        if self.server is not None:
-            mode_label = {
-                "escape": "ESCAPE MODE",
-                "dbd":    "DBD-MAZE",
-            }.get(self.mp_mode, self.mp_mode.upper())
-            n = self.server.count()
-            title = self.font_xl.render("HOSTING", True, CYAN)
-            self.surf.blit(title, (panel.x + 40, panel.y + 32))
-            mode_text = self.font_med.render(
-                mode_label, True, (239, 205, 71)
-            )
-            self.surf.blit(mode_text, (panel.x + 44, panel.y + 106))
-            count = self.font_med.render(
-                f"PLAYERS  {n + 1}/{network.MAX_PLAYERS}", True, WHITE
-            )
-            self.surf.blit(count, (panel.right - count.get_width() - 44,
-                                   panel.y + 48))
+        is_host = self.server is not None
+        mode_label = {
+            "escape": "ESCAPE MODE",
+            "dbd": "DBD-MAZE",
+        }.get(self.mp_mode, self.mp_mode.upper())
+        roster = self._lobby_roster()
+
+        title = self.font_xl.render(
+            "HOSTING" if is_host else "CONNECTED", True, CYAN
+        )
+        self.surf.blit(title, (panel.x + 40, panel.y + 32))
+        mode_text = self.font_med.render(
+            mode_label, True, (239, 205, 71)
+        )
+        self.surf.blit(mode_text, (panel.x + 44, panel.y + 106))
+        count = self.font_med.render(
+            f"PLAYERS  {len(roster)}/{network.MAX_PLAYERS}", True, WHITE
+        )
+        self.surf.blit(
+            count, (panel.right - count.get_width() - 44, panel.y + 48)
+        )
+        if is_host:
             port = self.font_tiny.render(
                 f"PORT {self.server.port}", True, (112, 143, 156)
             )
             self.surf.blit(port, (panel.right - port.get_width() - 44,
                                   panel.y + 112))
 
-            # host-decided settings
-            active_rows = ["PORTALS", "MAZE SHIFT", "HUNTER"] if self.mp_mode == "escape" else ["BOT RUNNERS"]
+        roster_x = panel.x + 42
+        roster_y = panel.y + 190
+        roster_w = 350
+        roster_head = self.font_tiny.render(
+            "LOBBY PLAYERS", True, (112, 143, 156)
+        )
+        self.surf.blit(roster_head, (roster_x, roster_y - 28))
+        for index, (player_id, name) in enumerate(roster):
+            row = pygame.Rect(roster_x, roster_y + index * 58, roster_w, 46)
+            pygame.draw.rect(self.surf, (10, 20, 29), row, border_radius=5)
+            color = PLAYER_COLORS[player_id % len(PLAYER_COLORS)]
+            pygame.draw.rect(
+                self.surf, color, (row.x, row.y, 4, row.height),
+                border_radius=2,
+            )
+            player_name = self.font_sm.render(name, True, WHITE)
+            self.surf.blit(
+                player_name,
+                (row.x + 18, row.centery - player_name.get_height() // 2),
+            )
+            tag = self.font_tiny.render(
+                "HOST" if player_id == 0 else f"P{player_id + 1}",
+                True, color,
+            )
+            self.surf.blit(
+                tag, (row.right - tag.get_width() - 14, row.y + 13)
+            )
+
+        bots = self.mp_lobby_bot_count if self.mp_mode == "dbd" else 0
+        if not is_host:
+            bot_row = pygame.Rect(
+                roster_x, roster_y + max(1, len(roster)) * 58,
+                roster_w, 46,
+            )
+            pygame.draw.rect(
+                self.surf, (10, 20, 29), bot_row, border_radius=5
+            )
+            bot_text = self.font_sm.render(
+                f"BOT RUNNERS  {bots}", True, (239, 205, 71)
+            )
+            self.surf.blit(
+                bot_text,
+                (
+                    bot_row.x + 18,
+                    bot_row.centery - bot_text.get_height() // 2,
+                ),
+            )
+
+        settings_x = panel.x + 430
+        settings_w = panel.right - settings_x - 42
+        head = self.font_tiny.render(
+            "MATCH SETTINGS", True, (112, 143, 156)
+        )
+        self.surf.blit(head, (settings_x, roster_y - 28))
+
+        if is_host:
+            active_rows = (
+                ["PORTALS", "MAZE SHIFT", "HUNTER"]
+                if self.mp_mode == "escape" else ["BOT RUNNERS"]
+            )
             self.settings_rows = active_rows
             if self.settings_index >= len(self.settings_rows):
                 self.settings_index = 0
 
-            head = self.font_tiny.render(
-                "MATCH SETTINGS", True, (112, 143, 156)
-            )
-            self.surf.blit(head, (panel.x + 44, panel.y + 178))
             row_h = 76
-            start_y = panel.y + 214
+            start_y = roster_y
             for i, key_name in enumerate(self.settings_rows):
                 key  = key_name.lower().replace(" ", "_")
                 val  = self._settings_value_str(key)
                 if key == "bot_runners":
-                    max_bots = max(0, network.MAX_PLAYERS - self.server.count() - 1)
+                    max_bots = max(
+                        0, network.MAX_PLAYERS - self.server.count() - 1
+                    )
                     if self.mp_settings[key] > max_bots:
                         self.mp_settings[key] = max_bots
                         val = str(max_bots)
+                    self.mp_lobby_bot_count = self.mp_settings[key]
                 y = start_y + i * row_h
-                row = pygame.Rect(panel.x + 42, y, panel.width - 84, 58)
+                row = pygame.Rect(settings_x, y, settings_w, 58)
+                self.setting_row_rects.append(row)
                 selected = i == self.settings_index
                 pygame.draw.rect(
                     self.surf,
@@ -1627,8 +1777,15 @@ class Game:
                 self.surf.blit(
                     label, (row.x + 18, row.centery - label.get_height() // 2)
                 )
-                left = pygame.Rect(row.right - 220, row.y + 8, 42, 42)
-                right = pygame.Rect(row.right - 52, row.y + 8, 42, 42)
+                control_w = min(190, row.width // 2)
+                control = pygame.Rect(
+                    row.right - control_w - 10,
+                    row.y + 8,
+                    control_w,
+                    42,
+                )
+                left = pygame.Rect(control.x, control.y, 42, 42)
+                right = pygame.Rect(control.right - 42, control.y, 42, 42)
                 for button, symbol in ((left, "<"), (right, ">")):
                     pygame.draw.rect(
                         self.surf, (18, 36, 46), button, border_radius=4
@@ -1641,7 +1798,7 @@ class Game:
                 value = self.font_med.render(val, True, (239, 205, 71))
                 self.surf.blit(
                     value,
-                    value.get_rect(center=(row.right - 115, row.centery)),
+                    value.get_rect(center=control.center),
                 )
                 self.setting_click_rects.append((key, left, right))
 
@@ -1661,20 +1818,17 @@ class Game:
                 start_text,
                 start_text.get_rect(center=self.lobby_start_rect.center),
             )
-
-        elif self.client is not None:
-            title = self.font_xl.render("CONNECTED", True, CYAN)
-            self.surf.blit(title, (panel.x + 44, panel.y + 44))
-            wait = self.font_lg.render(
-                f"PLAYER {self.player_id + 1}",
-                True, PLAYER_COLORS[self.player_id],
+        else:
+            player_info = self.font_med.render(
+                f"YOU ARE P{self.player_id + 1}",
+                True, PLAYER_COLORS[self.player_id % len(PLAYER_COLORS)],
             )
-            self.surf.blit(wait, wait.get_rect(center=panel.center))
+            self.surf.blit(player_info, (settings_x, roster_y + 4))
             msg = self.font_med.render(
                 "WAITING FOR HOST", True, (178, 197, 205)
             )
             self.surf.blit(
-                msg, msg.get_rect(center=(panel.centerx, panel.centery + 70))
+                msg, (settings_x, roster_y + 72)
             )
 
 
@@ -2431,6 +2585,10 @@ class Game:
         self.mp_network_profiles = {
             0: progression.network_profile(self.profile)
         }
+        self.mp_lobby_bot_count = (
+            self.mp_settings.get("bot_runners", 0)
+            if self.mp_mode == "dbd" else 0
+        )
         self.mp_status_msg = ""
         self.state = "lobby_wait_host"
 
@@ -2453,7 +2611,7 @@ class Game:
     def _prune_lobby_connections(self):
         dead = self.server.prune_dead()
         if not dead:
-            return
+            return False
         remapped = {
             0: progression.network_profile(self.profile)
         }
@@ -2466,6 +2624,7 @@ class Game:
             shift = sum(1 for index in dead if index < connection_index)
             remapped[player_id - shift] = profile
         self.mp_network_profiles = remapped
+        return True
 
     def mp_disconnect(self):
         """Tear down any open server/client; return to main menu."""
@@ -2506,6 +2665,7 @@ class Game:
         self.mp_network_profiles = {
             0: progression.network_profile(self.profile)
         }
+        self.mp_lobby_bot_count = 0
         self.exit_unlocked   = True
         self.player_id        = 0
         self.state            = "menu"
@@ -2745,7 +2905,8 @@ class Game:
         self._seed_skill_orbs()
             
         self.state = "mp_play"
-        self.server.broadcast({"type": "start", **self._serialize_state()})
+        self.server.broadcast(self._serialize_maze())
+        self.server.broadcast(self._serialize_start_state())
 
 
     def host_start_match(self):
@@ -2849,7 +3010,7 @@ class Game:
 
         # broadcast maze then start (include mode + DBD entities)
         self.server.broadcast(self._serialize_maze())
-        self.server.broadcast({"type": "start", "mode": self.mp_mode})
+        self.server.broadcast(self._serialize_start_state())
         self.state = "mp_play"
 
     def _serialize_maze(self):
@@ -2908,6 +3069,12 @@ class Game:
             "timer":   self.mp_match_timer,
             "exit_unlocked": self.exit_unlocked,
         }
+
+    def _serialize_start_state(self):
+        message = self._serialize_state()
+        message["type"] = "start"
+        message["mode"] = self.mp_mode
+        return message
 
     def _apply_state(self, msg):
         self.mp_players = msg["players"]
@@ -4604,27 +4771,43 @@ class Game:
         self.server.broadcast(self._serialize_maze())
 
     # ── client: per-frame tick ────────────────────────────────────────────────
-    def mp_client_tick(self, dt):
-        """Drain server messages; send our input throttled."""
-        for msg in self.client.drain():
-            t = msg.get("type")
-            if t == "welcome":
-                self.player_id = msg.get("id", 0)
-            elif t == "maze":
-                self._apply_maze(msg)
-            elif t == "state":
+    def _handle_client_message(self, msg):
+        t = msg.get("type")
+        if t == "welcome":
+            self.player_id = int(msg.get("id", 0))
+        elif t == "lobby_state":
+            self._apply_lobby_state(msg)
+        elif t == "start_vote":
+            self.state = "lobby_map_vote"
+            self.mp_vote_timer = float(msg.get("timer", 15.0))
+            self.mp_map_votes = {}
+        elif t == "votes_update":
+            votes = msg.get("votes", {})
+            self.mp_map_votes = {
+                int(key): value for key, value in votes.items()
+            }
+        elif t == "maze":
+            self._apply_maze(msg)
+        elif t == "state":
+            self._apply_state(msg)
+        elif t == "start":
+            self.mp_mode = msg.get("mode", self.mp_mode)
+            self.mp_winner = ""
+            self.mp_match_rewarded = False
+            self.mp_reward_summary = {}
+            self._reset_local_action_sequences()
+            if "players" in msg:
                 self._apply_state(msg)
-            elif t == "start":
-                self.mp_mode   = msg.get("mode", "escape")
-                self.mp_winner = ""
-                self.mp_match_rewarded = False
-                self._reset_local_action_sequences()
-                if self.state in ("lobby_wait_client", "mp_end"):
-                    self.state = "mp_play"
-            elif t == "end":
-                self.mp_winner = msg.get("winner", "")
-                self.state = "mp_end"
-                self._record_match_result()
+            self.state = "mp_play"
+        elif t == "end":
+            self.mp_winner = msg.get("winner", "")
+            self.state = "mp_end"
+            self._record_match_result()
+
+    def mp_client_tick(self, dt):
+        """Drain server messages once and send input while playing."""
+        for msg in self.client.drain():
+            self._handle_client_message(msg)
 
         if not self.client.alive:
             self.mp_status_msg = "Lost connection to host."
@@ -4632,10 +4815,11 @@ class Game:
             return
 
         # send input ~30Hz
-        self.mp_send_timer += dt
-        if self.mp_send_timer >= 1.0 / 30.0:
-            self.mp_send_timer = 0.0
-            self.client.send({"type": "input", **self.mp_local_input})
+        if self.state == "mp_play":
+            self.mp_send_timer += dt
+            if self.mp_send_timer >= 1.0 / 30.0:
+                self.mp_send_timer = 0.0
+                self.client.send({"type": "input", **self.mp_local_input})
 
     # ── multiplayer render ────────────────────────────────────────────────────
     def _draw_dbd_objects(self):
@@ -5704,6 +5888,14 @@ class Game:
                         self.handle_menu_hover(event.pos)
                     elif self.state == "how_to_play":
                         self.handle_help_hover(event.pos)
+                    elif self.state == "lobby":
+                        self.handle_lobby_hover(event.pos)
+                    elif self.state == "lobby_mode_pick":
+                        self.handle_mode_hover(event.pos)
+                    elif self.state == "lobby_map_vote":
+                        self.handle_map_vote_hover(event.pos)
+                    elif self.state == "lobby_wait_host":
+                        self.handle_setting_hover(event.pos)
 
                 # mouse clicks
                 if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -5864,36 +6056,25 @@ class Game:
                         
                         self.host_start_dbd_match()
                 elif self.client is not None:
-                    for msg in self.client.drain():
-                        if msg.get("type") == "votes_update":
-                            self.mp_map_votes = msg.get("votes", {})
-                            # keys might be strings via json, convert to int
-                            self.mp_map_votes = {int(k): v for k, v in self.mp_map_votes.items()}
-                        elif msg.get("type") == "start":
-                            self.state = "mp_play"
-                            self._reset_local_action_sequences()
-                            self._apply_state(msg)
+                    self.mp_vote_timer = max(0.0, self.mp_vote_timer - dt)
+                    self.mp_client_tick(dt)
             elif self.state == "lobby_wait_host" and self.server is not None:
                 # accept hellos, send welcomes
+                lobby_changed = False
                 for ci, msg in self.server.drain_all():
                     if msg.get("type") == "hello":
                         self.mp_network_profiles[ci + 1] = msg.get(
                             "profile", {}
                         )
                         self.server.send_to(ci, {"type": "welcome", "id": ci + 1})
-                self._prune_lobby_connections()
+                        lobby_changed = True
+                if self._prune_lobby_connections():
+                    lobby_changed = True
+                if lobby_changed:
+                    self._broadcast_lobby_state()
 
             elif self.state == "lobby_wait_client" and self.client is not None:
                 self.mp_client_tick(dt)
-                for msg in self.client.drain():
-                    if msg.get("type") == "start_vote":
-                        self.state = "lobby_map_vote"
-                        self.mp_vote_timer = 15.0
-                        self.mp_map_votes = {}
-                    elif msg.get("type") == "start":
-                        self.state = "mp_play"
-                        self._reset_local_action_sequences()
-                        self._apply_state(msg)
 
             elif self.state == "mp_end":
                 # keep the client draining so it sees the host's REPLAY
